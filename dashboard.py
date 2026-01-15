@@ -2,15 +2,16 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import re
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Diego FIRE Control V19.1", layout="wide", page_icon="🏦")
+st.set_page_config(page_title="Diego FIRE Control center", layout="wide", page_icon="🛡️")
 
 # --- ESTILOS CSS ---
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap');
-    body { font-family: 'Inter', sans-serif; background-color: #f1f5f9; }
+    body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
     .main-card { background: white; padding: 25px; border-radius: 15px; border: 1px solid #e2e8f0; margin-bottom: 20px; }
     .kpi-card { background: white; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0; text-align: center; border-top: 5px solid #3b82f6; }
     .kpi-val { font-family: 'JetBrains Mono', monospace; font-size: 1.8rem; font-weight: 800; color: #0f172a; }
@@ -22,9 +23,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- UTILIDADES DE FORMATO ---
-def fmt_puntos(numero):
-    """Formatea números con puntos para miles: 1.000.000"""
-    return f"{numero:,.0f}".replace(",", ".")
+def format_chile(valor):
+    """Convierte número a formato puntos: 1.800.000.000"""
+    return f"{int(valor):,}".replace(",", ".")
+
+def parse_chile(texto):
+    """Limpia el texto de puntos para volver a número"""
+    return int(re.sub(r'\D', '', texto)) if texto else 0
+
+def input_dinero(label, default, key):
+    """Crea un campo de texto que simula entrada con puntos"""
+    val_str = st.text_input(label, value=format_chile(default), key=key)
+    return parse_chile(val_str)
 
 # --- MOTOR MATEMÁTICO ---
 def generate_returns(n_sims, n_months, mu, sigma, df=5):
@@ -52,7 +62,8 @@ with st.sidebar:
     with st.expander("🌪️ Reglas de Crisis", expanded=True):
         use_guardrails = st.checkbox("Activar Recorte de Gasto", value=True)
         dd_trigger = st.slider("Gatillo de Caída (%)", 10, 50, 30) / 100
-        monto_recorte = st.number_input("Monto Recorte ($)", value=1200000, step=100000)
+        # Recorte también con puntos
+        m_recorte = input_dinero("Monto Recorte ($)", 1200000, "rec_key")
 
 # --- CUERPO PRINCIPAL ---
 st.title("🛡️ Diego FIRE Control center")
@@ -60,35 +71,30 @@ st.title("🛡️ Diego FIRE Control center")
 col_cap, col_inj = st.columns(2)
 with col_cap:
     st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    # Formateamos el valor inicial con puntos para que sea legible al usuario
-    cap_inicial = st.number_input("💰 Capital Líquido Inicial ($)", value=1800000000, step=1000000, format="%d", help="Ingresa el monto sin puntos, se visualizará correctamente al simular.")
-    st.caption(f"Valor ingresado: **$ {fmt_puntos(cap_inicial)}**")
+    cap_inicial = input_dinero("💰 Capital Líquido Inicial ($)", 1800000000, "cap_key")
     st.markdown('</div>', unsafe_allow_html=True)
 with col_inj:
     st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    inj_monto = st.number_input("💉 Inyección Futura ($)", value=0, step=1000000, format="%d")
+    inj_monto = input_dinero("💉 Inyección Futura ($)", 0, "inj_key")
     inj_anio = st.number_input("Año de Inyección", value=10, min_value=1)
-    st.caption(f"Inyección: **$ {fmt_puntos(inj_monto)}**")
     st.markdown('</div>', unsafe_allow_html=True)
 
-st.markdown("### 💸 Plan de Gasto Mensual (Formatos con puntos)")
+st.markdown("### 💸 Plan de Gasto Mensual (Formato con puntos)")
 c1, c2, c3 = st.columns(3)
 with c1:
     st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    g1 = st.number_input("Fase 1: Mensual ($)", value=6000000, step=100000, format="%d")
-    d1 = st.number_input("Fase 1: Años", value=7)
-    st.caption(f"Gasto: **$ {fmt_puntos(g1)}**")
+    g1 = input_dinero("Fase 1: Mensual ($)", 6000000, "g1_key")
+    d1 = st.number_input("Fase 1: Años", value=7, key="d1_key")
     st.markdown('</div>', unsafe_allow_html=True)
 with c2:
     st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    g2 = st.number_input("Fase 2: Mensual ($)", value=5500000, step=100000, format="%d")
-    d2 = st.number_input("Fase 2: Años", value=13)
-    st.caption(f"Gasto: **$ {fmt_puntos(g2)}**")
+    g2 = input_dinero("Fase 2: Mensual ($)", 5500000, "g2_key")
+    d2 = st.number_input("Fase 2: Años", value=13, key="d2_key")
     st.markdown('</div>', unsafe_allow_html=True)
 with c3:
     st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    g3 = st.number_input("Fase 3: Mensual ($)", value=5000000, step=100000, format="%d")
-    st.caption(f"Gasto: **$ {fmt_puntos(g3)}**")
+    g3 = input_dinero("Fase 3: Mensual ($)", 5000000, "g3_key")
+    st.caption(f"Desde el año {d1+d2+1}")
     st.markdown('</div>', unsafe_allow_html=True)
 
 # --- SIMULACIÓN ---
@@ -114,10 +120,14 @@ if st.button("🚀 EJECUTAR ESCENARIOS", type="primary", use_container_width=Tru
         
         target = g1 if t <= d1*12 else (g2 if t <= (d1+d2)*12 else g3)
         peak = np.maximum(peak, wealth[t])
-        if use_guardrails and np.any((peak - wealth[t])/peak > dd_trigger):
-            target -= monto_recorte
+        
+        # Aplicamos recorte si drawdown > trigger
+        mask_crisis = (peak - wealth[t])/peak > dd_trigger
+        current_spend = np.full(n_sims, target)
+        if use_guardrails:
+            current_spend[mask_crisis] -= m_recorte
             
-        wealth[t] -= target
+        wealth[t] -= current_spend
         wealth[t] = np.maximum(wealth[t], 0)
         is_fail |= (wealth[t] == 0)
 
@@ -129,9 +139,9 @@ if st.button("🚀 EJECUTAR ESCENARIOS", type="primary", use_container_width=Tru
     k1, k2, k3 = st.columns(3)
     k1.markdown(f'<div class="kpi-card {"success" if res_liq > 85 else "warning"}"><div class="kpi-val">{res_liq:.1f}%</div><div class="kpi-lbl">Éxito Líquido</div></div>', unsafe_allow_html=True)
     k2.markdown(f'<div class="kpi-card danger"><div class="kpi-val">{np.mean(is_fail)*100:.1f}%</div><div class="kpi-lbl">Riesgo Plan Z</div></div>', unsafe_allow_html=True)
-    k3.markdown(f'<div class="kpi-card money"><div class="kpi-val">${fmt_puntos(med_final)}</div><div class="kpi-lbl">Herencia Mediana (P50)</div></div>', unsafe_allow_html=True)
+    k3.markdown(f'<div class="kpi-card money"><div class="kpi-val">${format_chile(med_final)}</div><div class="kpi-lbl">Herencia Mediana (P50)</div></div>', unsafe_allow_html=True)
 
-    # Gráfico con puntos en los ejes
+    # Gráfico
     p10, p50, p90 = np.percentile(wealth, [10, 50, 90], axis=1)
     x = np.arange(len(p50))/12
     fig = go.Figure([
@@ -140,7 +150,7 @@ if st.button("🚀 EJECUTAR ESCENARIOS", type="primary", use_container_width=Tru
         go.Scatter(x=x, y=p50, line=dict(color='#0f172a', width=3), name='Escenario Central')
     ])
     fig.update_layout(
-        title="Evolución de Patrimonio (Formato con puntos)", 
+        title="Evolución de Patrimonio", 
         template="plotly_white", 
         yaxis=dict(tickformat=",.0f", tickprefix="$ "),
         hovermode="x unified"
