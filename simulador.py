@@ -17,7 +17,43 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     if 'current_results' not in st.session_state:
         st.session_state.current_results = None
 
-    # --- 2. CONFIGURACIÓN TÉCNICA ---
+    # --- 2. CSS PARA BOTÓN FLOTANTE (ESTRATEGIA FIXED LEFT) ---
+    # Esto fuerza al botón primario a quedarse fijo abajo a la izquierda, 
+    # simulando estar al final de la barra lateral pero siempre visible.
+    st.markdown("""
+    <style>
+        div.stButton > button[kind="primary"] {
+            position: fixed;
+            bottom: 20px;
+            left: 20px; /* Ajustado para calzar en la barra lateral */
+            width: 300px; /* Ancho estándar aprox de la sidebar */
+            z-index: 999999; /* Por encima de todo */
+            box-shadow: 0px 4px 12px rgba(0,0,0,0.3);
+            border-radius: 8px;
+            padding: 12px 20px;
+            font-weight: bold;
+            font-size: 1rem;
+            background-color: #ff4b4b;
+            color: white;
+            border: none;
+        }
+        div.stButton > button[kind="primary"]:hover {
+            box-shadow: 0px 6px 16px rgba(0,0,0,0.4);
+            background-color: #ff2b2b;
+        }
+        /* Ajuste para móviles: si la pantalla es chica, que flote a la derecha */
+        @media (max-width: 640px) {
+            div.stButton > button[kind="primary"] {
+                left: auto;
+                right: 20px;
+                width: auto;
+                border-radius: 50px;
+            }
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # --- 3. CONFIGURACIÓN TÉCNICA ---
     @dataclass
     class AssetBucket:
         name: str; weight: float = 0.0; mu_nominal: float = 0.0; sigma_nominal: float = 0.0
@@ -32,7 +68,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         inflation_mean: float = 0.035; inflation_vol: float = 0.01; prob_crisis: float = 0.05
         crisis_drift: float = 0.75; crisis_vol: float = 1.25
 
-    # --- 3. ESCENARIOS ---
+    # --- 4. ESCENARIOS ---
     SCENARIOS = {
         "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.0, "vol": 20.0, "crisis": 10, "desc": "Alta inflación, retornos bajos."},
         "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5, "desc": "Condiciones históricas normales."},
@@ -50,7 +86,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             st.session_state.sim_params["vol"] = vals["vol"]
             st.session_state.sim_params["crisis"] = vals["crisis"]
 
-    # --- 4. MOTOR MATEMÁTICO (NOMINAL) ---
+    # --- 5. MOTOR MATEMÁTICO (NOMINAL) ---
     def run_simulation(cfg, assets, withdrawals):
         dt = 1/cfg.steps_per_year
         n_steps = int(cfg.horizon_years * cfg.steps_per_year)
@@ -101,7 +137,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         return int(re.sub(r'\D', '', v)) if v else 0
     def fmt(v): return f"{int(v):,}".replace(",", ".")
 
-    # --- 5. INTERFAZ (SIDEBAR) ---
+    # --- 6. INTERFAZ (SIDEBAR) ---
     with st.sidebar:
         st.header("1. Escenario Base")
         st.selectbox("Cargar Preset:", list(SCENARIOS.keys()), key="scenario_selector", index=1, on_change=update_params)
@@ -124,13 +160,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         
         st.markdown("### 💀 Análisis de Ruina")
         ruin_percentile = st.slider("Sensibilidad de Riesgo (%)", 70, 99, 90)
+        
+        # Espacio vacío para que el botón flotante no tape el último input si haces scroll
+        st.markdown("<br><br><br>", unsafe_allow_html=True)
 
-        st.markdown("---")
-        # --- AQUÍ ESTÁ EL BOTÓN AHORA (INTEGRADO) ---
-        # use_container_width=True hace que llene la barra lateral, viéndose profesional.
-        btn_run = st.button("🚀 EJECUTAR ANÁLISIS", type="primary", use_container_width=True)
-
-    # --- 6. INTERFAZ (MAIN) ---
+    # --- 7. INTERFAZ (MAIN) ---
     st.markdown("### 💰 Estructura de Capital")
     ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
     if ini_def == 0: ini_def = 1800000000
@@ -149,7 +183,10 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     with g2: r2 = clean("Fase 2 ($/mes)", 5500000, "r2"); d2 = st.number_input("Años", 13)
     with g3: r3 = clean("Fase 3 ($/mes)", 5000000, "r3"); st.caption("Resto vida")
 
-    # --- 7. EJECUCIÓN ---
+    # --- 8. EJECUCIÓN (BOTÓN FUERA DE SIDEBAR PARA FLOTAR CORRECTAMENTE) ---
+    # Al ponerlo aquí, el CSS 'position: fixed' funciona relativo a la pantalla y no al sidebar container
+    btn_run = st.button("🚀 EJECUTAR ANÁLISIS", type="primary")
+
     if btn_run:
         assets = [
             AssetBucket("RV", pct_rv/100, p_rv/100, p_vol/100),
@@ -185,7 +222,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 "n_fails": len(fails)
             }
 
-    # --- 8. RESULTADOS ---
+    # --- 9. RESULTADOS ---
     if st.session_state.current_results:
         res = st.session_state.current_results
         
