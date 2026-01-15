@@ -1,4 +1,3 @@
-# NOMBRE DEL ARCHIVO: simulador.py
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -145,6 +144,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             # Resultados
             final_nom = paths[:, -1]
             success = np.mean(final_nom > 0) * 100
+            # Herencia ajustada a valor real de hoy (deflactada)
             legacy_real = np.median(final_nom / cpi[:, -1])
             
             st.session_state.current_results = {"succ": success, "leg": legacy_real, "paths": paths, "in": (cap, r1)}
@@ -166,4 +166,14 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         # Gráfico
         st.subheader("🔭 Proyección")
         y = np.arange(res["paths"].shape[1])/12
-        p10 =
+        p10 = np.percentile(res["paths"], 10, axis=0)
+        p50 = np.percentile(res["paths"], 50, axis=0)
+        p90 = np.percentile(res["paths"], 90, axis=0)
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='blue', width=3), name='Mediana'))
+        fig.add_trace(go.Scatter(x=y, y=p10, line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=y, y=p90, fill='tonexty', fillcolor='rgba(0,0,255,0.1)', line=dict(width=0), name='Rango 80%'))
+        
+        fig.update_layout(height=400, yaxis_title="Capital Nominal ($)", hovermode="x unified")
+        st.plotly_chart(fig, use_container_width=True)
