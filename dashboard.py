@@ -2,356 +2,323 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import re
 import json
+from datetime import date
 
-# --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Diego FIRE Control V26 (Analytics)", layout="wide", page_icon="🔬")
+# --- 1. CONFIGURACIÓN PREMIUM ---
+st.set_page_config(page_title="Diego Family Office", layout="wide", page_icon="🏛️")
 
-# --- ESTILOS CSS ---
+# --- 2. ESTÉTICA "BANKING GRADE" (CSS) ---
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap');
-    body { font-family: 'Inter', sans-serif; background-color: #f8fafc; margin-bottom: 150px; }
+    @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;700;800&family=Roboto+Mono:wght@400;500&display=swap');
     
-    .main-card { background: white; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0; margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.02); }
+    /* General */
+    body { font-family: 'Manrope', sans-serif; background-color: #f4f6f9; color: #1e293b; }
+    h1, h2, h3 { color: #0f172a; font-weight: 800; letter-spacing: -0.5px; }
     
-    /* Footer Flotante */
-    .floating-footer {
-        position: fixed; bottom: 0; left: 0; width: 100%;
-        background-color: #ffffff; border-top: 3px solid #64748b;
-        box-shadow: 0px -4px 15px rgba(0,0,0,0.1); z-index: 9999;
-        padding: 10px 0px; display: flex; justify-content: center; align-items: center; gap: 40px;
+    /* Tarjetas Métricas (KPIs) */
+    .metric-card {
+        background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); transition: transform 0.2s;
     }
-    .footer-item { text-align: center; min-width: 140px; }
-    .footer-label { font-size: 0.65rem; color: #64748b; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
-    .footer-value { font-size: 1.3rem; font-weight: 800; color: #0f172a; font-family: 'JetBrains Mono'; }
+    .metric-card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05); }
+    .metric-title { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #64748b; font-weight: 700; margin-bottom: 8px; }
+    .metric-value { font-family: 'Manrope', sans-serif; font-size: 2rem; font-weight: 800; color: #0f172a; }
+    .metric-sub { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; display: flex; align-items: center; gap: 5px; }
     
-    .status-green { color: #16a34a; } .status-yellow { color: #d97706; } .status-red { color: #dc2626; }
+    /* Colores Semánticos */
+    .positive { color: #10b981; } .negative { color: #ef4444; } .neutral { color: #f59e0b; }
     
-    /* Tablas Análisis */
-    .metric-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; }
-    .metric-name { font-weight: 600; color: #475569; }
-    .metric-val { font-family: 'JetBrains Mono'; color: #0f172a; }
+    /* Inputs */
+    .stTextInput input { font-family: 'Roboto Mono', monospace; font-weight: 500; }
+    
+    /* Footer Fijo Elegante */
+    .executive-footer {
+        position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+        background: rgba(15, 23, 42, 0.95); color: white; backdrop-filter: blur(10px);
+        padding: 12px 40px; border-radius: 50px; display: flex; gap: 40px;
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3); z-index: 9999;
+    }
+    .footer-stat { text-align: center; }
+    .footer-stat span { display: block; font-size: 0.7rem; opacity: 0.7; text-transform: uppercase; }
+    .footer-stat strong { font-size: 1.2rem; font-weight: 700; color: #fff; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- UTILIDADES ---
-def fmt(valor): return f"{int(valor):,}".replace(",", ".")
-def parse(texto): return int(re.sub(r'\D', '', texto)) if texto else 0
+# --- 3. UTILIDADES INTELIGENTES ---
+def fmt(v): return f"{int(v):,}".replace(",", ".")
+def parse(t): return int(re.sub(r'\D', '', t)) if t else 0
+def input_dinero(lbl, d, k): return parse(st.text_input(lbl, value=fmt(d), key=k))
 
-def input_dinero(label, default, key, disabled=False):
-    val_str = st.text_input(label, value=fmt(default), key=key, disabled=disabled)
-    return parse(val_str)
-
-# --- CLASIFICADOR JSON ---
-def procesar_gems_json(data_raw):
+# --- 4. MOTOR ACTUARIAL & FINANCIERO ---
+def procesar_gems(json_raw):
+    """Interpreta la cartera automáticamente."""
     try:
-        if isinstance(data_raw, dict) and "registros" in data_raw:
-             lista = data_raw["registros"][0]["instrumentos"]
-             fecha = data_raw["registros"][0].get("fecha_dato", "N/A")
-        elif isinstance(data_raw, list):
-             lista = data_raw
-             fecha = "Lista Manual"
-        else: return 0, 0, pd.DataFrame(), "Error"
-    except: return 0, 0, pd.DataFrame(), "Error"
+        data = json_raw.get("registros", [{}])[0].get("instrumentos", []) if isinstance(json_raw, dict) else json_raw
+    except: return 0, 0, pd.DataFrame()
 
-    total_rv, total_rf, total_clp = 0, 0, 0
-    df_rows = []
-    kw_rv = ["agresivo", "fondo a", "gestión activa", "moneda renta", "equity", "accion", "etf", "sp500"]
+    total_rv, total_rf, total_liq = 0, 0, 0
+    rows = []
+    kw_rv = ["agresivo", "fondo a", "equity", "accion", "etf", "sp500", "nasdaq"]
     
-    for item in lista:
-        nom = item.get("nombre", "").lower()
-        tipo = item.get("tipo", "").lower()
-        sub = str(item.get("subtipo", "")).lower()
-        saldo = item.get("saldo_clp", 0)
+    for i in data:
+        nom, tipo, saldo = i.get("nombre", "").lower(), i.get("tipo", "").lower(), i.get("saldo_clp", 0)
+        if "pasivo" in tipo or "hipotecario" in nom: continue # Ignorar deuda
         
-        if "pasivo" in tipo or "hipotecario" in nom:
-             df_rows.append({"Instrumento": item.get("nombre"), "Monto": fmt(saldo), "Categoría": "🔴 PASIVO"})
-             continue
-
-        es_rv = any(k in nom or k in sub for k in kw_rv)
-        cat = "Renta Variable" if es_rv else "Renta Fija"
-        if es_rv: total_rv += saldo
+        cat = "Renta Variable" if any(k in nom for k in kw_rv) else "Renta Fija"
+        if cat == "Renta Variable": total_rv += saldo
         else: total_rf += saldo
+        total_liq += saldo
+        rows.append({"Activo": i.get("nombre"), "Monto": fmt(saldo), "Clase": cat})
         
-        total_clp += saldo
-        df_rows.append({"Instrumento": item.get("nombre"), "Monto": fmt(saldo), "Categoría": cat})
-        
-    pct_rv = total_rv / total_clp if total_clp > 0 else 0
-    return total_clp, pct_rv, pd.DataFrame(df_rows), fecha
+    return total_liq, (total_rv/total_liq if total_liq else 0), pd.DataFrame(rows)
 
-# --- MATEMÁTICA ANUALIDAD ---
-def calc_pmt(pv, r, n):
-    if n <= 0: return 0
-    r_m = r / 12
-    n_m = n * 12
-    if r_m == 0: return pv / n_m
-    return pv * (r_m * (1 + r_m)**n_m) / ((1 + r_m)**n_m - 1)
-
-# --- MOTOR SIMULACIÓN CORE ---
-def simulacion_core(n_sims, months, cap_ini, eventos_dict, g1, d1, g2, d2, g3, 
-                   alloc_rv, ret_rv, vol_rv, ret_rf, vol_rf, corr, use_guard, dd_trig, m_cut, drag, inflacion):
+def proyeccion_montecarlo(n_sims, months, cap, g1, d1, g2, d2, g3, pct_rv, params):
+    # Desempaquetar
+    mu_rv, sig_rv = (params['r_rv'] - params['inf'] - params['cost'])/12, params['v_rv']/np.sqrt(12)
+    mu_rf, sig_rf = (params['r_rf'] - params['inf'] - params['cost'])/12, params['v_rf']/np.sqrt(12)
     
-    # Ajuste de Tasas Reales
-    mu_rv, sigma_rv = (ret_rv - inflacion - drag)/12, vol_rv/np.sqrt(12)
-    mu_rf, sigma_rf = (ret_rf - inflacion - drag)/12, vol_rf/np.sqrt(12)
-    
-    df = 5 # T-Student
-    std_adj = np.sqrt((df - 2) / df)
+    # Motor T-Student (Cisnes Negros)
+    df = 5
+    std_adj = np.sqrt((df-2)/df)
     z1 = np.random.standard_t(df, (months, n_sims)) * std_adj
     z2 = np.random.standard_t(df, (months, n_sims)) * std_adj
-    eps_rf = corr * z1 + np.sqrt(1 - corr**2) * z2
+    eps = params['corr'] * z1 + np.sqrt(1 - params['corr']**2) * z2
     
-    wealth = np.zeros((months + 1, n_sims))
-    wealth[0] = cap_ini
-    peak = np.full(n_sims, cap_ini)
-    ruin_month = np.zeros(n_sims)
+    # Trayectorias
+    wealth = np.zeros((months+1, n_sims))
+    wealth[0] = cap
+    ruin_idx = np.full(n_sims, -1) # -1 significa "no quebró"
     
-    # Tracking de supervivencia mensual
-    survival_curve = np.ones(months + 1) * 100
+    peak = np.full(n_sims, cap)
     
-    for t in range(1, months + 1):
-        ret = (mu_rv + sigma_rv * z1[t-1]) * alloc_rv + (mu_rf + sigma_rf * eps_rf[t-1]) * (1 - alloc_rv)
+    for t in range(1, months+1):
+        # Retornos Mercado
+        ret = (mu_rv + sig_rv * z1[t-1]) * pct_rv + (mu_rf + sig_rf * eps[t-1]) * (1 - pct_rv)
         
-        mask_alive = wealth[t-1] > 0
-        wealth[t, mask_alive] = wealth[t-1, mask_alive] * (1 + ret[mask_alive])
+        # Flujo de Caja
+        mask_ok = wealth[t-1] > 0
+        wealth[t, mask_ok] = wealth[t-1, mask_ok] * (1 + ret[mask_ok])
         
-        if t in eventos_dict:
-            wealth[t, mask_alive] += eventos_dict[t]
-        
+        # Gasto Dinámico
         target = g1 if t <= d1*12 else (g2 if t <= (d1+d2)*12 else g3)
-        peak[mask_alive] = np.maximum(peak[mask_alive], wealth[t, mask_alive])
+        peak[mask_ok] = np.maximum(peak[mask_ok], wealth[t, mask_ok])
         
-        gasto_real = np.full(n_sims, target)
-        if use_guard:
-            with np.errstate(divide='ignore', invalid='ignore'):
-                dd = (peak - wealth[t]) / peak
-                dd = np.nan_to_num(dd)
-            mask_crisis = dd > dd_trig
-            gasto_real[mask_crisis] -= m_cut
-            
-        wealth[t, mask_alive] -= gasto_real[mask_alive]
-        
-        new_ruins = (wealth[t] <= 0) & (wealth[t-1] > 0)
-        wealth[t, wealth[t] <= 0] = 0
-        ruin_month[new_ruins] = t
-        
-        # Calcular supervivencia al cierre del mes
-        survival_curve[t] = (np.sum(wealth[t] > 0) / n_sims) * 100
-        
-    is_fail = wealth[-1] <= 0
-    return wealth, is_fail, ruin_month, survival_curve
+        # Regla de Crisis (Guardrail)
+        if params['guardrail']:
+            dd = (peak - wealth[t]) / peak
+            # Si cae más del 30%, recortamos gasto
+            mask_cut = (dd > 0.30) & mask_ok
+            current_g = np.full(n_sims, target)
+            current_g[mask_cut] -= 1200000 # Recorte duro
+            wealth[t, mask_ok] -= current_g[mask_ok]
+        else:
+            wealth[t, mask_ok] -= target
 
-# --- SIDEBAR ---
+        # Registro de Ruina
+        just_died = (wealth[t] <= 0) & (wealth[t-1] > 0)
+        wealth[t, wealth[t] < 0] = 0
+        ruin_idx[just_died] = t
+        
+    return wealth, ruin_idx
+
+# --- 5. INTERFAZ DE USUARIO (DASHBOARD) ---
+
+# HEADER
+c_logo, c_title = st.columns([1, 6])
+with c_logo: st.markdown("## 🏛️")
+with c_title: st.markdown("# Diego Family Office \n ### Informe de Solvencia Patrimonial")
+
+# SIDEBAR: DATOS & SUPUESTOS
 with st.sidebar:
-    st.header("⚙️ Configuración")
-    modo = st.radio("Fuente de Datos", ["Manual", "Pegar JSON"], horizontal=True)
-    json_data = None
-    if modo == "Pegar JSON":
-        txt = st.text_area("JSON Raw", height=100)
-        if txt: 
-            try: json_data = json.loads(txt)
-            except: st.error("JSON inválido")
-
-    with st.expander("📉 Variables Macroeconómicas", expanded=True):
-        n_sims = st.select_slider("Sims", [1000, 2000, 5000], 2000)
-        inflacion = st.number_input("Inflación (%)", 3.0)/100
-        drag = st.number_input("Costos/Impuestos (%)", 1.0)/100
-        
-    with st.expander("🏠 Plan Z", expanded=False):
-        val_casa = input_dinero("Valor Casa ($)", 250000000, "z_v")
-        z_arr = input_dinero("Arriendo Futuro ($)", 800000, "z_a")
-        z_tasa = st.number_input("Tasa Anualidad (%)", 4.0)/100
-
-    with st.expander("🌪️ Reglas Crisis", expanded=False):
-        use_g = st.checkbox("Activar Recortes", True)
-        dd_t = st.slider("Gatillo (%)", 10, 50, 30)/100
-        m_cut = input_dinero("Monto Recorte ($)", 1200000, "cut")
-
-# --- UI PRINCIPAL ---
-st.title("🛡️ Diego FIRE Control V26")
-
-# 1. CAPITAL
-cap_final, alloc_final = 0, 0.6
-if modo == "Pegar JSON" and json_data:
-    cap_calc, alloc_calc, df_audit, f_dat = procesar_gems_json(json_data)
-    cap_final, alloc_final = cap_calc, alloc_calc
-    st.success(f"Datos Cargados: $ {fmt(cap_final)} ({alloc_final*100:.1f}% RV)")
-else:
-    c1, c2 = st.columns([2, 1])
-    with c1: cap_final = input_dinero("💰 Capital Líquido ($)", 1800000000, "c_man")
-    with c2: alloc_final = st.slider("% RV", 0, 100, 60)/100.0
-
-# 2. EVENTOS
-st.markdown("### 📅 Eventos de Capital")
-with st.expander("Ver / Editar Eventos (Auto, Herencia)", expanded=False):
-    c_e1, c_e2 = st.columns(2)
-    ev1_m = input_dinero("Inyección ($)", 0, "ev1"); ev1_y = c_e1.number_input("Año Iny.", 10)
-    ev2_m = input_dinero("Gasto Extra ($)", -45000000, "ev2"); ev2_y = c_e2.number_input("Año Gasto", 3)
-
-eventos = {}
-if ev1_m!=0: eventos[ev1_y*12]=ev1_m
-if ev2_m!=0: eventos[ev2_y*12]=ev2_m
-
-# 3. GASTOS
-st.markdown("### 💸 Gasto Regular")
-c1, c2, c3 = st.columns(3)
-with c1: g1 = input_dinero("Fase 1 ($)", 6000000, "g1"); d1 = st.number_input("Años F1", 7)
-with c2: g2 = input_dinero("Fase 2 ($)", 5500000, "g2"); d2 = st.number_input("Años F2", 13)
-with c3: g3 = input_dinero("Fase 3 ($)", 5000000, "g3")
-
-# --- INDICADORES "DÓNDE ESTOY" ---
-swr = (g1 * 12) / cap_final * 100 if cap_final > 0 else 0
-runway = cap_final / (g1 * 12) if g1 > 0 else 0
-
-st.markdown("#### 🧭 Tu Ubicación Actual")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Tasa de Retiro (SWR)", f"{swr:.2f}%", help="Regla general segura es < 4%")
-k2.metric("Pista de Aterrizaje", f"{runway:.1f} Años", help="Años que dura el dinero sin ninguna rentabilidad (colchón neto)")
-k3.metric("Capital Objetivo 4%", f"$ {fmt(g1*12*25)}", help="Capital necesario para que el retiro sea el 4%")
-diff = cap_final - (g1*12*25)
-k4.metric("Brecha FIRE", f"$ {fmt(diff)}", delta_color="normal")
-
-# --- EJECUCIÓN ---
-if st.button("🚀 INICIAR DIAGNÓSTICO PROFUNDO", type="primary", use_container_width=True):
-    # Parametros Base
-    r_rv, v_rv = 0.065, 0.18
-    r_rf, v_rf = 0.015, 0.05
-    corr_base = 0.8
+    st.markdown("### 1. Perfil del Cliente")
+    birth_year = st.number_input("Año de Nacimiento", 1980, 2005, 1982)
+    current_year = date.today().year
+    age = current_year - birth_year
+    life_expectancy = st.slider("Esperanza de Vida (Planificación)", 85, 100, 95)
+    horizon_years = life_expectancy - age
     
-    # 1. SIMULACIÓN BASE
-    wealth, is_fail, ruin_months, survival_curve = simulacion_core(
-        n_sims, 40*12, cap_final, eventos, g1, d1, g2, d2, g3,
-        alloc_final, r_rv, v_rv, r_rf, v_rf, corr_base, use_g, dd_t, m_cut, drag, inflacion
+    st.info(f"👤 **Edad:** {age} años \n\n 🏁 **Horizonte:** {horizon_years} años (hasta {current_year + horizon_years})")
+
+    st.markdown("### 2. Origen de Datos")
+    source = st.radio("Fuente", ["Pegar JSON (Gems)", "Manual"], label_visibility="collapsed")
+    
+    cap_liq, pct_rv = 0, 0.6
+    
+    if source == "Pegar JSON (Gems)":
+        txt = st.text_area("JSON Raw", height=100, placeholder="Pega aquí...")
+        if txt:
+            try:
+                c, p, df = procesar_gems(json.loads(txt))
+                cap_liq, pct_rv = c, p
+                st.success("✅ Datos sincronizados")
+            except: st.error("❌ Error en JSON")
+    else:
+        cap_liq = input_dinero("Capital Líquido ($)", 1800000000, "man_cap")
+        pct_rv = st.slider("% Renta Variable", 0, 100, 60)/100.0
+
+    st.markdown("### 3. Supuestos Macro")
+    with st.expander("Ver Parámetros Avanzados"):
+        inf = st.number_input("Inflación Est. (%)", 3.0)/100
+        cost = st.number_input("Costos Gestión (%)", 1.0)/100
+        guard = st.checkbox("Activar 'Guardrails' (Recorte en Crisis)", True)
+
+# MAIN: TARJETAS SUPERIORES
+st.markdown("---")
+col_g1, col_g2, col_g3 = st.columns(3)
+
+with col_g1:
+    st.markdown("#### 💸 Fase 1: Lifestyle Actual")
+    g1 = input_dinero("Gasto Mensual ($)", 6000000, "g1")
+    d1 = st.number_input("Duración (Años)", 7, key="d1")
+
+with col_g2:
+    st.markdown("#### 📉 Fase 2: Transición")
+    g2 = input_dinero("Gasto Mensual ($)", 5500000, "g2")
+    d2 = st.number_input("Duración (Años)", 13, key="d2")
+
+with col_g3:
+    st.markdown("#### 👴 Fase 3: Madurez (Salud)")
+    g3 = input_dinero("Gasto Mensual ($)", 5000000, "g3")
+    st.caption(f"Desde los {age + d1 + d2} años en adelante")
+
+# EJECUCIÓN
+if cap_liq > 0:
+    # Parametros Mercado
+    params = {
+        'r_rv': 0.075, 'v_rv': 0.18, # 7.5% retorno, 18% volatilidad
+        'r_rf': 0.035, 'v_rf': 0.05, # 3.5% retorno, 5% volatilidad
+        'corr': 0.8, 'inf': inf, 'cost': cost, 'guardrail': guard
+    }
+    
+    # Simulación
+    sims = 2000
+    months = horizon_years * 12
+    paths, ruin_idx = proyeccion_montecarlo(sims, months, cap_liq, g1, d1, g2, d2, g3, pct_rv, params)
+    
+    # KPIs
+    success_rate = (np.sum(ruin_idx == -1) / sims) * 100
+    median_legacy = np.median(paths[-1])
+    
+    # Análisis de "Zona de Muerte" (¿Cuándo ocurre el riesgo?)
+    ruin_years = (ruin_idx[ruin_idx > -1] / 12) + age # Convertir meses a edad
+    
+    risk_start_age = "N/A"
+    most_dangerous_age = "N/A"
+    
+    if len(ruin_years) > 0:
+        # P10 de la ruina (el momento donde empieza el riesgo temprano)
+        risk_start_age = f"{np.percentile(ruin_years, 10):.0f} Años"
+        # La moda (donde se concentra)
+        most_dangerous_age = f"{int(np.median(ruin_years))} Años"
+
+    # --- RENDERIZADO VISUAL ---
+    
+    # 1. TARJETAS DE IMPACTO
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    
+    with kpi1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Solvencia del Plan</div>
+            <div class="metric-value {'positive' if success_rate > 90 else 'negative'}">{success_rate:.1f}%</div>
+            <div class="metric-sub">Probabilidad de Éxito</div>
+        </div>""", unsafe_allow_html=True)
+        
+    with kpi2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Capital Líquido</div>
+            <div class="metric-value">${fmt(cap_liq/1e6)}M</div>
+            <div class="metric-sub">Disponible Hoy</div>
+        </div>""", unsafe_allow_html=True)
+        
+    with kpi3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Herencia (P50)</div>
+            <div class="metric-value neutral">${fmt(median_legacy/1e6)}M</div>
+            <div class="metric-sub">A los {age + horizon_years} años</div>
+        </div>""", unsafe_allow_html=True)
+
+    with kpi4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-title">Zona de Riesgo</div>
+            <div class="metric-value negative">{risk_start_age}</div>
+            <div class="metric-sub">Edad de 1er fallo</div>
+        </div>""", unsafe_allow_html=True)
+
+    # 2. GRÁFICO "CONO DE INCERTIDUMBRE" (Estilo Bloomberg)
+    st.markdown("### 🔭 Proyección Patrimonial")
+    
+    # Preparar datos
+    years_axis = np.arange(months + 1) / 12 + age
+    p10 = np.percentile(paths, 10, axis=1)
+    p50 = np.percentile(paths, 50, axis=1)
+    p90 = np.percentile(paths, 90, axis=1)
+    
+    fig = go.Figure()
+    
+    # Relleno P10-P90
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([years_axis, years_axis[::-1]]),
+        y=np.concatenate([p90, p10[::-1]]),
+        fill='toself', fillcolor='rgba(148, 163, 184, 0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        name='Rango Probable (80% Casos)', hoverinfo="skip"
+    ))
+    
+    # Mediana
+    fig.add_trace(go.Scatter(
+        x=years_axis, y=p50,
+        line=dict(color='#0f172a', width=4),
+        name='Escenario Central'
+    ))
+    
+    # Línea de Ruina
+    fig.add_shape(type="line", x0=age, x1=age+horizon_years, y0=0, y1=0,
+                  line=dict(color="#ef4444", width=2, dash="dash"))
+    
+    # Configuración Ejes
+    fig.update_layout(
+        template="plotly_white",
+        height=500,
+        hovermode="x unified",
+        xaxis=dict(title="Tu Edad", showgrid=False),
+        yaxis=dict(title="Patrimonio ($)", showgrid=True, gridcolor='#f1f5f9', tickformat=",.0f"),
+        legend=dict(orientation="h", y=1.02, x=0.01)
     )
+    st.plotly_chart(fig, use_container_width=True)
     
-    prob = (1 - np.mean(is_fail)) * 100
-    herencia = np.median(wealth[-1])
+    # 3. EXECUTIVE SUMMARY (Interpretación Automática)
+    st.markdown("### 📝 Executive Summary")
     
-    # Footer
-    c_s = "status-green" if prob >= 90 else "status-red"
-    st.markdown(f"""<div class="floating-footer">
-        <div class="footer-item"><div class="footer-label">Éxito</div><div class="footer-value {c_s}">{prob:.1f}%</div></div>
-        <div class="footer-item"><div class="footer-label">Herencia</div><div class="footer-value">${fmt(herencia)}</div></div>
-    </div>""", unsafe_allow_html=True)
-
-    # --- PESTAÑAS ANALÍTICAS ---
-    t1, t2, t3, t4 = st.tabs(["📊 Proyección", "💀 Riesgo Temporal", "🌪️ Sensibilidad", "🏠 Plan Z"])
+    analysis_text = f"""
+    **Estimado Diego:**
     
-    with t1:
-        p10, p50, p90 = np.percentile(wealth, [10, 50, 90], axis=1)
-        x = np.arange(len(p50))/12
-        fig = go.Figure([
-            go.Scatter(x=x, y=p90, line=dict(width=0), showlegend=False),
-            go.Scatter(x=x, y=p10, fill='tonexty', fillcolor='rgba(37, 99, 235, 0.1)', name='Rango'),
-            go.Scatter(x=x, y=p50, line=dict(color='#0f172a', width=3), name='Mediana')
-        ])
-        fig.update_layout(template="plotly_white", yaxis=dict(tickformat=",.0f", tickprefix="$ "), height=450, title="Evolución Patrimonio")
-        st.plotly_chart(fig, use_container_width=True)
+    Basado en los parámetros actuales, tu cartera de **${fmt(cap_liq)}** tiene una probabilidad del **{success_rate:.1f}%** de sostener tu estilo de vida hasta los **{age + horizon_years} años**.
+    """
+    
+    if success_rate > 95:
+        analysis_text += f"\n\n🟢 **Conclusión:** El plan es **excesivamente sólido**. Tienes capital excedente. Podrías aumentar tu gasto mensual en la Fase 1 o reducir tu exposición a Renta Variable para dormir más tranquilo."
+    elif success_rate > 80:
+        analysis_text += f"\n\n🟡 **Conclusión:** El plan es **viable pero requiere disciplina**. La zona de peligro comienza a los **{risk_start_age}**. Es crucial monitorear la inflación y mantener los costos de gestión bajos."
+    else:
+        analysis_text += f"\n\n🔴 **Conclusión:** El plan presenta **riesgo estructural**. Existe una alta probabilidad de agotar la liquidez alrededor de los **{most_dangerous_age}**. Se recomienda urgentemente: 1) Reducir gasto Fase 1, 2) Postergar retiro total, o 3) Planificar la venta de activos inmobiliarios (Plan Z)."
 
-    with t2:
-        # SUPERVIVENCIA + HISTOGRAMA
-        c_risk1, c_risk2 = st.columns([2, 1])
-        
-        with c_risk1:
-            # Curva de Supervivencia
-            st.markdown("##### 📉 Curva de Supervivencia")
-            df_surv = pd.DataFrame({"Mes": np.arange(len(survival_curve)), "Año": np.arange(len(survival_curve))/12, "Probabilidad": survival_curve})
-            fig_s = px.line(df_surv, x="Año", y="Probabilidad", range_y=[0, 105])
-            fig_s.add_hline(y=90, line_dash="dot", line_color="green", annotation_text="Zona Segura (90%)")
-            fig_s.add_hline(y=75, line_dash="dot", line_color="orange", annotation_text="Zona Alerta (75%)")
-            st.plotly_chart(fig_s, use_container_width=True)
-            
-        with c_risk2:
-            st.markdown("##### 📍 ¿Cuándo empieza el peligro?")
-            # Buscar el primer mes donde la supervivencia baja del 95% y del 80%
-            idx_95 = np.argmax(survival_curve < 95)
-            idx_80 = np.argmax(survival_curve < 80)
-            
-            if survival_curve[-1] > 95:
-                st.success("✅ **Riesgo Nulo:** Tu plan no baja del 95% de éxito en todo el periodo.")
-            else:
-                year_risk = idx_95 / 12
-                st.warning(f"⚠️ **Inicio del Riesgo:** Año {year_risk:.1f}")
-                st.caption("Aquí la probabilidad de éxito cae bajo el 95%.")
-                
-                if survival_curve[-1] < 80:
-                    year_crit = idx_80 / 12
-                    st.error(f"🚨 **Zona Crítica:** Año {year_crit:.1f}")
-                    st.caption("Probabilidad cae bajo el 80%.")
+    st.info(analysis_text)
+    
+    # Footer Flotante
+    st.markdown(f"""
+    <div class="executive-footer">
+        <div class="footer-stat"><span>Solvencia</span><strong>{success_rate:.1f}%</strong></div>
+        <div class="footer-stat"><span>Herencia Est.</span><strong>${fmt(median_legacy/1e6)}M</strong></div>
+        <div class="footer-stat"><span>Riesgo Inicio</span><strong>{risk_start_age}</strong></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    with t3:
-        st.markdown("#### 🌪️ Ranking de Variables: ¿Qué afecta más a tu plan?")
-        st.caption("Comparamos tu escenario base contra escenarios estresados (Simulaciones rápidas de 500 iteraciones).")
-        
-        # Escenarios
-        scenarios = [
-            ("Base", 0, 0, 0),
-            ("Inflación (+1.5%)", 0.015, 0, 0),
-            ("Bolsa (-1.5% Retorno)", 0, -0.015, 0),
-            ("Gastos (+10%)", 0, 0, 1.10)
-        ]
-        
-        results_sens = []
-        bar = st.progress(0)
-        
-        # Ejecución rápida
-        for i, (name, d_inf, d_ret, d_spend) in enumerate(scenarios):
-            # Modificadores
-            inf_test = inflacion + d_inf
-            ret_rv_test = r_rv + d_ret
-            # Gasto
-            g1_t = g1 * d_spend if d_spend > 0 else g1
-            g2_t = g2 * d_spend if d_spend > 0 else g2
-            g3_t = g3 * d_spend if d_spend > 0 else g3
-            
-            _, is_fail_s, _, _ = simulacion_core(
-                500, 40*12, cap_final, eventos, g1_t, d1, g2_t, d2, g3_t,
-                alloc_final, ret_rv_test, v_rv, r_rf, v_rf, corr_base, use_g, dd_t, m_cut, drag, inf_test
-            )
-            prob_s = (1 - np.mean(is_fail_s)) * 100
-            results_sens.append({"Escenario": name, "Éxito": prob_s})
-            bar.progress((i+1)/4)
-            
-        base_val = results_sens[0]["Éxito"]
-        
-        # Tabla de Deltas
-        for res in results_sens[1:]:
-            delta = res["Éxito"] - base_val
-            st.markdown(f"""
-            <div class="metric-row">
-                <span class="metric-name">{res['Escenario']}</span>
-                <span class="metric-val" style="color: {'red' if delta < -5 else 'orange'};">
-                    {res['Éxito']:.1f}% (Impacto: {delta:.1f} pp)
-                </span>
-            </div>
-            """, unsafe_allow_html=True)
-            
-        # Conclusión Sensibilidad
-        deltas = [r["Éxito"] - base_val for r in results_sens[1:]]
-        worst_idx = np.argmin(deltas)
-        worst_name = results_sens[1+worst_idx]["Escenario"]
-        st.info(f"💡 **Conclusión:** Tu plan es más sensible a: **{worst_name}**.")
-
-    with t4:
-        # PLAN Z (Cálculo)
-        fails = ruin_months[ruin_months > 0] / 12
-        y_fail = np.percentile(fails, 20) if len(fails)>0 else 40 # Usamos P20 para ser conservadores
-        
-        neto = val_casa * 0.96
-        years_left = max(1, 40 - y_fail)
-        income_z = calc_pmt(neto, z_tasa, years_left)
-        final_money = income_z - z_arr
-        
-        c_z1, c_z2 = st.columns(2)
-        with c_z1:
-            st.metric("Año Activación (P20)", f"Año {y_fail:.1f}")
-            st.metric("Capital Venta", f"$ {fmt(neto)}")
-        with c_z2:
-            st.metric("Disponible para Vivir", f"$ {fmt(final_money)}", delta="Mensual")
-            if final_money < 1000000:
-                st.error("Plan Z Insuficiente")
-            else:
-                st.success("Plan Z Viable")
+else:
+    st.warning("👈 Por favor carga los datos en la barra lateral para generar el informe.")
