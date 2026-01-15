@@ -9,18 +9,40 @@ import re
 # --- FUNCIÓN PRINCIPAL ---
 def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default_tc=930, default_ret_rf=6.0, default_ret_rv=10.0):
     
-    # --- 1. GESTIÓN DE ESTADO (Para permitir edición sobre presets) ---
-    # Inicializamos claves de inputs si no existen
+    # --- 1. GESTIÓN DE ESTADO ---
+    # Valores por defecto iniciales
     if 'sim_params' not in st.session_state:
         st.session_state.sim_params = {
             "inf": 3.0, "rf": default_ret_rf, "rv": default_ret_rv, "vol": 16.0, "crisis": 5
         }
-    if 'last_scenario' not in st.session_state:
-        st.session_state.last_scenario = "Estable (Base) ☁️"
     if 'current_results' not in st.session_state:
         st.session_state.current_results = None
 
-    # --- 2. CONFIGURACIÓN TÉCNICA ---
+    # --- 2. CSS PARA BOTÓN FLOTANTE ---
+    # Esto hace que el botón primario ("Ejecutar") flote abajo a la derecha
+    st.markdown("""
+    <style>
+        /* Estilo para el botón flotante */
+        div.stButton > button[kind="primary"] {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            z-index: 9999;
+            box-shadow: 0px 4px 12px rgba(0,0,0,0.3);
+            border-radius: 50px;
+            padding: 15px 30px;
+            font-weight: bold;
+            font-size: 1.1rem;
+            transition: all 0.3s ease;
+        }
+        div.stButton > button[kind="primary"]:hover {
+            transform: scale(1.05);
+            box-shadow: 0px 6px 16px rgba(0,0,0,0.4);
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # --- 3. CONFIGURACIÓN TÉCNICA ---
     @dataclass
     class AssetBucket:
         name: str; weight: float = 0.0; mu_nominal: float = 0.0; sigma_nominal: float = 0.0
@@ -35,17 +57,16 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         inflation_mean: float = 0.035; inflation_vol: float = 0.01; prob_crisis: float = 0.05
         crisis_drift: float = 0.75; crisis_vol: float = 1.25
 
-    # --- 3. DEFINICIÓN DE ESCENARIOS (Suavizados) ---
+    # --- 4. ESCENARIOS (Valores Predeterminados) ---
     SCENARIOS = {
-        "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.0, "vol": 20.0, "crisis": 10}, # Ajustado para no ser tan extremo (25%)
-        "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5},
-        "Optimista ☀️": {"rf": 7.5, "rv": 13.0, "inf": 2.5, "vol": 14.0, "crisis": 2},
-        "Mis Datos (Home) 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
+        "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.5, "vol": 20.0, "crisis": 10, "desc": "Alta inflación, retornos bajos."},
+        "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5, "desc": "Condiciones históricas normales."},
+        "Optimista ☀️": {"rf": 7.5, "rv": 13.0, "inf": 2.5, "vol": 14.0, "crisis": 2, "desc": "Mercados favorables."},
+        "Mis Datos (Home) 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5, "desc": "Datos cargados de tu portafolio."}
     }
 
-    # --- 4. CALLBACKS (Lógica de Actualización) ---
+    # Callback para cargar valores predeterminados al cambiar el selector
     def update_params():
-        # Cuando cambia el selectbox, actualizamos los valores de los inputs
         sel = st.session_state.scenario_selector
         if sel in SCENARIOS:
             vals = SCENARIOS[sel]
@@ -69,7 +90,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         p_crisis = 1 - (1 - cfg.prob_crisis)**dt
         in_crisis = np.zeros(cfg.n_sims, dtype=bool)
         
-        ruin_idx = np.full(cfg.n_sims, -1) # -1 = No quebró
+        ruin_idx = np.full(cfg.n_sims, -1)
 
         for t in range(1, n_steps + 1):
             inf_shock = np.random.normal(cfg.inflation_mean * dt, cfg.inflation_vol * np.sqrt(dt), cfg.n_sims)
@@ -92,10 +113,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             prev = capital[:, t-1]
             alive = prev > 0
             
-            # Cálculo capital
             capital[alive, t] = (prev[alive] * ret[alive]) - wd_actual[alive]
             
-            # Detectar Ruina Exacta
+            # Detectar Ruina
             just_died = (capital[:, t] <= 0) & (prev > 0)
             ruin_idx[just_died] = t
             capital[~alive, t] = 0
@@ -112,26 +132,26 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     with st.sidebar:
         st.header("1. Escenario Base")
         
-        # SELECTOR PRINCIPAL
+        # SELECTOR DE ESCENARIO (Con Callback)
         st.selectbox(
             "Cargar Preset:", 
             list(SCENARIOS.keys()), 
             key="scenario_selector",
-            on_change=update_params, # Al cambiar, actualiza los inputs de abajo
-            index=1
+            index=1,
+            on_change=update_params # ¡Esto actualiza los inputs automáticamente!
         )
         
         st.markdown("---")
-        st.markdown("### 🔧 Ajuste Fino (Editable)")
-        # Inputs conectados a Session State. Si los cambias, se usan estos valores.
+        st.markdown("### 🔧 Variables (Editables)")
         
+        # Estos inputs están vivos: cambian con el preset, pero los puedes tocar después
         p_inf = st.number_input("Inflación Anual (%)", value=st.session_state.sim_params["inf"], step=0.1, format="%.1f", key="in_inf")
         p_rf = st.number_input("Retorno Nom. RF (%)", value=st.session_state.sim_params["rf"], step=0.1, format="%.1f", key="in_rf")
         p_rv = st.number_input("Retorno Nom. RV (%)", value=st.session_state.sim_params["rv"], step=0.1, format="%.1f", key="in_rv")
         p_vol = st.slider("Volatilidad RV", 10.0, 30.0, st.session_state.sim_params["vol"], key="in_vol")
         p_cris = st.slider("Prob. Crisis (%)", 0, 20, st.session_state.sim_params["crisis"], key="in_cris")
 
-        # Actualizamos el diccionario manual con lo que el usuario haya tocado
+        # Sincronizamos cambios manuales de vuelta al estado
         st.session_state.sim_params.update({"inf": p_inf, "rf": p_rf, "rv": p_rv, "vol": p_vol, "crisis": p_cris})
 
         st.markdown("---")
@@ -139,13 +159,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         n_sims = st.slider("Simulaciones", 500, 5000, 2000)
         horiz = st.slider("Horizonte (Años)", 10, 60, 40)
         
-        # CONFIGURACIÓN MÉTRICA RUINA
         st.markdown("### 💀 Análisis de Ruina")
-        ruin_percentile = st.slider("Sensibilidad de Riesgo (%)", 70, 99, 90, help="Si eliges 90%, calculamos a partir de qué año ocurren el 90% de las quiebras (ignorando los casos extremos tempranos).")
-
-        btn_run = st.button("🚀 EJECUTAR ANÁLISIS", type="primary")
+        ruin_percentile = st.slider("Sensibilidad de Riesgo (%)", 70, 99, 90)
 
     # --- 7. INTERFAZ (MAIN) ---
+    
     # CAPITAL
     st.markdown("### 💰 Estructura de Capital")
     ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
@@ -157,18 +175,18 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     
     monto_rv = cap * (pct_rv/100); monto_rf = cap * ((100-pct_rv)/100)
     with c3:
-        st.metric("Mix", f"{100-pct_rv}% RF / {pct_rv}% RV")
-        st.caption(f"Usando retornos: RF {p_rf}% | RV {p_rv}%")
+        st.metric("Mix de Inversión", f"{100-pct_rv}% RF / {pct_rv}% RV")
+        st.caption(f"Retornos usados: RF {p_rf}% | RV {p_rv}%")
 
     # GASTOS
-    st.markdown("### 💸 Flujo de Retiros")
+    st.markdown("### 💸 Flujo de Retiros (Nominal Inicial)")
     g1, g2, g3 = st.columns(3)
-    with g1: r1 = clean("Fase 1 ($)", 6000000, "r1"); d1 = st.number_input("Años", 7)
-    with g2: r2 = clean("Fase 2 ($)", 5500000, "r2"); d2 = st.number_input("Años", 13)
-    with g3: r3 = clean("Fase 3 ($)", 5000000, "r3"); st.caption("Resto vida")
+    with g1: r1 = clean("Fase 1 ($/mes)", 6000000, "r1"); d1 = st.number_input("Años", 7)
+    with g2: r2 = clean("Fase 2 ($/mes)", 5500000, "r2"); d2 = st.number_input("Años", 13)
+    with g3: r3 = clean("Fase 3 ($/mes)", 5000000, "r3"); st.caption("Resto vida")
 
-    # --- 8. EJECUCIÓN ---
-    if btn_run:
+    # BOTÓN FLOTANTE (Dispara la lógica)
+    if st.button("🚀 EJECUTAR ANÁLISIS", type="primary"):
         assets = [
             AssetBucket("RV", pct_rv/100, p_rv/100, p_vol/100),
             AssetBucket("RF", (100-pct_rv)/100, p_rf/100, 0.05)
@@ -180,24 +198,18 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         ]
         cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap, n_sims=n_sims, inflation_mean=p_inf/100, prob_crisis=p_cris/100)
         
-        with st.spinner("Procesando futuros..."):
+        with st.spinner("Simulando futuros..."):
             paths, cpi, ruin_idx = run_simulation(cfg, assets, wds)
             
-            # --- CÁLCULO DE MÉTRICAS AVANZADAS ---
             final_nom = paths[:, -1]
             success = np.mean(final_nom > 0) * 100
             prob_ruin = 100 - success
             legacy_real = np.median(final_nom / cpi[:, -1])
             
-            # Análisis de Ruina
-            fails = ruin_idx[ruin_idx > -1] # Solo índices de quiebra
+            fails = ruin_idx[ruin_idx > -1]
             if len(fails) > 0:
                 fail_years = fails / 12
                 median_ruin_year = np.median(fail_years)
-                # Percentil: ¿A partir de qué año ocurre el X% de las ruinas?
-                # Si threshold es 90%, buscamos el percentil 10 (el 10% más temprano se ignora, el 90% restante ocurre post-fecha)
-                # O como lo pediste: "a partir de qué año se ubica el 85-90%"
-                # Usaremos Percentil (100 - X). Ej: 90% -> Percentil 10.
                 pct_risk_year = np.percentile(fail_years, 100 - ruin_percentile)
             else:
                 median_ruin_year = 0
@@ -209,36 +221,33 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 "n_fails": len(fails)
             }
 
-    # --- 9. RESULTADOS ---
+    # --- 8. RESULTADOS ---
     if st.session_state.current_results:
         res = st.session_state.current_results
         
         # Color Semáforo
-        clr = "green" if res["succ"] > 90 else "orange" if res["succ"] > 75 else "red"
+        clr = "#10b981" if res["succ"] > 90 else "#f59e0b" if res["succ"] > 75 else "#ef4444"
         
         # TARJETA PRINCIPAL
         st.markdown(f"""
         <div style="text-align:center; padding:20px; border:2px solid {clr}; border-radius:15px; background-color: rgba(255,255,255,0.05); margin-top:20px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
-            <h1 style="color:{clr}; margin:0; font-size: 3rem;">{res['succ']:.1f}%</h1>
-            <p style="margin:0; text-transform:uppercase; letter-spacing:1px; color:gray;">Probabilidad de Éxito</p>
+            <h1 style="color:{clr}; margin:0; font-size: 3.5rem;">{res['succ']:.1f}%</h1>
+            <p style="margin:0; text-transform:uppercase; letter-spacing:1px; color:gray; font-weight:bold;">Probabilidad de Éxito</p>
         </div>
         """, unsafe_allow_html=True)
 
-        # MÉTRICAS DETALLADAS (LO QUE PEDISTE)
-        st.markdown("### 💀 Análisis de Supervivencia")
+        # MÉTRICAS DETALLADAS
+        st.markdown("### 💀 Análisis de Riesgo & Legado")
         c1, c2, c3, c4 = st.columns(4)
         
         with c1:
-            st.metric("Probabilidad de Ruina", f"{res['ruin']:.1f}%", help="Porcentaje de escenarios donde el dinero se agota antes del fin.")
-        
+            st.metric("Probabilidad de Ruina", f"{res['ruin']:.1f}%", help="Riesgo de agotar capital antes del horizonte.")
         with c2:
             val = f"Año {res['med_ruin']:.1f}" if res['n_fails'] > 0 else "Nunca"
-            st.metric("Mediana de Ruina", val, help="En los casos que fallan, este es el año central donde ocurre el desastre.")
-            
+            st.metric("Mediana de Ruina", val, help="Año central donde ocurre la quiebra (en casos fallidos).")
         with c3:
             val = f"Año {res['risk_start']:.1f}" if res['n_fails'] > 0 else "N/A"
-            st.metric(f"Zona de Riesgo ({ruin_percentile}%)", val, help=f"El {ruin_percentile}% de las quiebras ocurren DESPUÉS de este año. (Filtra las desgracias muy tempranas).")
-        
+            st.metric(f"Inicio Zona Riesgo ({ruin_percentile}%)", val, help=f"El {ruin_percentile}% de las quiebras ocurren después de este año.")
         with c4:
             st.metric("Herencia Real (Hoy)", f"${fmt(res['leg'])}")
 
@@ -250,13 +259,12 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         p90 = np.percentile(res["paths"], 90, axis=0)
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='#2563eb', width=3), name='Mediana'))
+        fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='#3b82f6', width=3), name='Mediana'))
         fig.add_trace(go.Scatter(x=y, y=p10, line=dict(width=0), showlegend=False))
-        fig.add_trace(go.Scatter(x=y, y=p90, fill='tonexty', fillcolor='rgba(37, 99, 235, 0.1)', line=dict(width=0), name='Rango 80%'))
+        fig.add_trace(go.Scatter(x=y, y=p90, fill='tonexty', fillcolor='rgba(59, 130, 246, 0.1)', line=dict(width=0), name='Rango 80%'))
         
-        # Línea de Ruina
         if res['risk_start'] > 0:
-            fig.add_vline(x=res['risk_start'], line_dash="dot", line_color="red", annotation_text=f"Inicio Riesgo {ruin_percentile}%")
+            fig.add_vline(x=res['risk_start'], line_dash="dot", line_color="#ef4444", annotation_text="Inicio Zona Crítica")
             
-        fig.update_layout(height=450, yaxis_title="Capital Nominal ($)", hovermode="x unified", title="Evolución del Patrimonio")
+        fig.update_layout(height=500, yaxis_title="Capital Nominal ($)", hovermode="x unified", title="Evolución del Patrimonio (Nominal)")
         st.plotly_chart(fig, use_container_width=True)
