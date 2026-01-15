@@ -4,18 +4,41 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dataclasses import dataclass, replace
-from typing import List, Dict
 import re
 
 # --- FUNCIÓN PRINCIPAL ---
 def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default_tc=930, default_ret_rf=6.0, default_ret_rv=10.0):
     
-    # 1. GESTIÓN DE ESTADO
+    # --- 1. CONFIGURACIÓN INICIAL Y ESTADO ---
     if 'current_results' not in st.session_state: st.session_state.current_results = None
-    if 'sim_params' not in st.session_state:
-        st.session_state.sim_params = {"inf": 3.0, "rf": default_ret_rf, "rv": default_ret_rv, "vol": 16.0, "crisis": 5}
+    
+    # Definir Escenarios
+    SCENARIOS = {
+        "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.5, "vol": 20.0, "crisis": 10},
+        "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5},
+        "Optimista ☀️": {"rf": 7.5, "rv": 13.0, "inf": 2.5, "vol": 14.0, "crisis": 2},
+        "Mis Datos 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
+    }
 
-    # --- 2. MOTOR MATEMÁTICO AVANZADO (Recuperado de tu archivo) ---
+    # Inicializar valores en session_state si no existen (para que los inputs tengan memoria)
+    if "in_inf" not in st.session_state: st.session_state.in_inf = 3.0
+    if "in_rf" not in st.session_state: st.session_state.in_rf = default_ret_rf
+    if "in_rv" not in st.session_state: st.session_state.in_rv = default_ret_rv
+    if "in_vol" not in st.session_state: st.session_state.in_vol = 16.0
+    if "in_cris" not in st.session_state: st.session_state.in_cris = 5
+
+    # CALLBACK: Esta función fuerza la actualización de los inputs cuando cambias el selectbox
+    def update_params_callback():
+        sel = st.session_state.scenario_selector
+        if sel in SCENARIOS:
+            vals = SCENARIOS[sel]
+            st.session_state.in_inf = vals["inf"]
+            st.session_state.in_rf = vals["rf"]
+            st.session_state.in_rv = vals["rv"]
+            st.session_state.in_vol = vals["vol"]
+            st.session_state.in_cris = vals["crisis"]
+
+    # --- 2. CLASES MATEMÁTICAS (Advanced) ---
     @dataclass
     class AssetBucket:
         name: str; weight: float = 0.0; mu_nominal: float = 0.0; sigma_nominal: float = 0.0
@@ -35,60 +58,54 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             self.cfg = config; self.assets = assets; self.withdrawals = withdrawals
             self.dt = 1/config.steps_per_year
             self.total_steps = int(config.horizon_years * config.steps_per_year)
-            # Matriz de Correlación (Simplificada para 2 activos base + USD implícito si aplica)
+            # Matriz de Correlación Base (Se puede editar)
             self.corr_matrix = np.eye(len(assets))
 
         def run(self):
             n_sims, n_steps, n_assets = self.cfg.n_sims, self.total_steps, len(self.assets)
             
-            # Inicializar
-            capital_paths = np.zeros((n_sims, n_steps + 1))
-            capital_paths[:, 0] = self.cfg.initial_capital
-            
-            # Asset Values individuales (Para simular correlación)
-            asset_values = np.zeros((n_sims, n_assets))
-            for i, a in enumerate(self.assets): asset_values[:, i] = self.cfg.initial_capital * a.weight
-            
+            # Arrays Principales
+            capital_paths = np.zeros((n_sims, n_steps + 1)); capital_paths[:, 0] = self.cfg.initial_capital
             cpi_paths = np.ones((n_sims, n_steps + 1))
             
-            # Cholesky para correlación
+            # Valores individuales de activos
+            asset_values = np.zeros((n_sims, n_assets))
+            for i, a in enumerate(self.assets): asset_values[:, i] = self.cfg.initial_capital * a.weight
+
+            # Cholesky
             try: L = np.linalg.cholesky(self.corr_matrix)
             except: L = np.eye(n_assets)
             
-            # Crisis
             p_crisis = 1 - (1 - self.cfg.prob_crisis)**self.dt
             in_crisis = np.zeros(n_sims, dtype=bool)
 
             for t in range(1, n_steps + 1):
-                # Inflación
+                # 1. Inflación Estocástica
                 inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
                 cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + inf_shock)
                 
-                # Crisis Switch
+                # 2. Crisis Switch
                 new_c = np.random.rand(n_sims) < p_crisis
                 in_crisis = np.logical_or(in_crisis, new_c)
                 in_crisis[np.random.rand(n_sims) < 0.15] = False 
                 
-                # Shocks Correlacionados
+                # 3. Retornos Correlacionados
                 z_uncorr = np.random.normal(0, 1, (n_sims, n_assets))
                 z_corr = np.dot(z_uncorr, L.T)
                 
-                # Evolución de cada activo
                 step_rets = np.zeros((n_sims, n_assets))
                 for i, asset in enumerate(self.assets):
                     mu, sig = asset.mu_nominal, asset.sigma_nominal
                     if np.any(in_crisis):
                         mu *= self.cfg.crisis_drift
                         sig *= self.cfg.crisis_vol
-                    
-                    # Retorno Browniano: (mu - 0.5*sig^2)*dt + sig*sqrt(dt)*Z
+                    # Browniano Geométrico
                     step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                 
                 asset_values *= np.exp(step_rets)
                 
-                # Retiros y Rebalanceo
+                # 4. Retiros
                 total_cap = np.sum(asset_values, axis=1)
-                
                 year = t / 12
                 wd_base = 0
                 for w in self.withdrawals:
@@ -97,53 +114,48 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         break
                 wd_nom = wd_base * cpi_paths[:, t]
                 
-                # Ratio de retiro
+                # Aplicar retiro proporcional
                 ratio = np.divide(wd_nom, total_cap, out=np.zeros_like(total_cap), where=total_cap!=0)
                 ratio = np.clip(ratio, 0, 1)
                 asset_values *= (1 - ratio[:, np.newaxis])
                 
-                # Rebalanceo Anual
+                # 5. Rebalanceo Anual
                 if t % 12 == 0:
                     tot = np.sum(asset_values, axis=1)
                     alive = tot > 0
-                    for i, asset in enumerate(self.assets):
-                        asset_values[alive, i] = tot[alive] * asset.weight
+                    if np.any(alive):
+                        for i, asset in enumerate(self.assets):
+                            asset_values[alive, i] = tot[alive] * asset.weight
                 
                 capital_paths[:, t] = np.sum(asset_values, axis=1)
                 
             return capital_paths, cpi_paths
 
-    # --- 3. HERRAMIENTAS AVANZADAS (GOAL SEEK & OPTIMIZER) ---
+    # --- 3. FUNCIONES DE ANÁLISIS (GOAL SEEK & OPTIMIZER) ---
     def goal_seek(target_prob, base_sim, var_type, r_min, r_max):
-        # Búsqueda binaria para encontrar el valor que da X% de éxito
         low, high = r_min, r_max
         best_val = low
+        cfg_fast = replace(base_sim.cfg, n_sims=300) # Rápido para iterar
         
-        cfg_fast = replace(base_sim.cfg, n_sims=300) # Más rápido
-        
-        for _ in range(10):
+        for _ in range(12): # 12 iteraciones es suficiente precisión
             mid = (low + high) / 2
             
-            # Clonar configuración
+            # Clonar configuración y modificar variable
             new_wds = []
             new_horizon = base_sim.cfg.horizon_years
             
             if var_type == 'duration':
                 new_horizon = int(mid)
                 cfg_fast = replace(cfg_fast, horizon_years=new_horizon)
-                # Ajustar tramos al nuevo horizonte
                 for w in base_sim.withdrawals:
                     to_y = min(w.to_year, new_horizon)
                     if w == base_sim.withdrawals[-1]: to_y = new_horizon
                     if w.from_year < new_horizon:
                         new_wds.append(WithdrawalTramo(w.from_year, to_y, w.amount_nominal_monthly_start))
-            else:
-                # Ajustar montos
-                factor = 1.0 # Si var_type es monto, ajustamos todos proporcionalmente o solo el primero
+            else: # Monto
+                factor = mid / base_sim.withdrawals[0].amount_nominal_monthly_start if base_sim.withdrawals[0].amount_nominal_monthly_start > 0 else 1
                 for w in base_sim.withdrawals:
-                    # Asumimos que Goal Seek ajusta el "Nivel de Vida" general (todos los tramos)
-                    new_amt = w.amount_nominal_monthly_start * (mid / base_sim.withdrawals[0].amount_nominal_monthly_start)
-                    new_wds.append(WithdrawalTramo(w.from_year, w.to_year, new_amt))
+                    new_wds.append(WithdrawalTramo(w.from_year, w.to_year, w.amount_nominal_monthly_start * factor))
             
             sim = AdvancedSimulator(cfg_fast, base_sim.assets, new_wds)
             sim.corr_matrix = base_sim.corr_matrix
@@ -153,44 +165,36 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             if abs(success - target_prob) < 0.01: return mid
             
             if var_type == 'duration':
-                if success < target_prob: high = mid # Menos años = más éxito
+                if success < target_prob: high = mid 
                 else: low = mid
             else:
-                if success < target_prob: high = mid # Menos plata = más éxito
+                if success < target_prob: high = mid 
                 else: low = mid
             best_val = mid
-            
         return best_val
 
-    def optimize_mix(base_sim, base_prob):
-        # Fuerza bruta inteligente: Probar mix de RV de 0 a 100
+    def optimize_mix(base_sim):
         results = []
         cfg_fast = replace(base_sim.cfg, n_sims=200)
-        
-        # Recuperar parametros base de los activos
-        # Asumimos assets[0]=RV, assets[1]=RF por construcción abajo
-        rv_asset = base_sim.assets[0]
-        rf_asset = base_sim.assets[1]
+        # Recuperar activos base (RV=0, RF=1)
+        rv_mu, rv_sig = base_sim.assets[0].mu_nominal, base_sim.assets[0].sigma_nominal
+        rf_mu, rf_sig = base_sim.assets[1].mu_nominal, base_sim.assets[1].sigma_nominal
         
         for pct_rv in range(0, 101, 10):
             pct_rf = 100 - pct_rv
-            
             new_assets = [
-                AssetBucket("RV", pct_rv/100, rv_asset.mu_nominal, rv_asset.sigma_nominal),
-                AssetBucket("RF", pct_rf/100, rf_asset.mu_nominal, rf_asset.sigma_nominal)
+                AssetBucket("RV", pct_rv/100, rv_mu, rv_sig),
+                AssetBucket("RF", pct_rf/100, rf_mu, rf_sig)
             ]
-            
             sim = AdvancedSimulator(cfg_fast, new_assets, base_sim.withdrawals)
-            # Matriz correlación simple 2x2
-            sim.corr_matrix = np.array([[1.0, 0.2], [0.2, 1.0]]) 
-            
+            sim.corr_matrix = base_sim.corr_matrix
             paths, _ = sim.run()
             succ = np.mean(paths[:, -1] > 0)
             results.append({"RV": pct_rv, "RF": pct_rf, "Prob": succ})
             
         return pd.DataFrame(results)
 
-    # --- INTERFAZ ---
+    # --- 4. INTERFAZ ---
     def clean(lbl, d, k): 
         v = st.text_input(lbl, value=f"{int(d):,}".replace(",", "."), key=k)
         return int(re.sub(r'\D', '', v)) if v else 0
@@ -208,48 +212,45 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     </style>
     """, unsafe_allow_html=True)
 
-    # SIDEBAR
-    SCENARIOS = {
-        "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.0, "vol": 20.0, "crisis": 10},
-        "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5},
-        "Optimista ☀️": {"rf": 7.5, "rv": 13.0, "inf": 2.5, "vol": 14.0, "crisis": 2},
-        "Mis Datos 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
-    }
-
-    def update_params():
-        s = st.session_state.scenario_selector
-        if s in SCENARIOS: st.session_state.sim_params.update(SCENARIOS[s])
-
+    # --- SIDEBAR ---
     with st.sidebar:
         st.header("1. Escenario")
-        st.selectbox("Preset:", list(SCENARIOS.keys()), key="scenario_selector", index=1, on_change=update_params)
+        # El selectbox dispara el callback que actualiza los session_state
+        st.selectbox("Preset:", list(SCENARIOS.keys()), key="scenario_selector", index=1, on_change=update_params_callback)
         
-        with st.expander("Variables", expanded=True):
-            p_inf = st.number_input("Inflación (%)", value=st.session_state.sim_params["inf"], step=0.1, key="in_inf")
-            p_rf = st.number_input("Retorno RF (%)", value=st.session_state.sim_params["rf"], step=0.1, key="in_rf")
-            p_rv = st.number_input("Retorno RV (%)", value=st.session_state.sim_params["rv"], step=0.1, key="in_rv")
-            p_vol = st.slider("Volatilidad RV", 10.0, 30.0, st.session_state.sim_params["vol"], key="in_vol")
-            p_cris = st.slider("Prob. Crisis (%)", 0, 20, st.session_state.sim_params["crisis"], key="in_cris")
-            st.session_state.sim_params.update({"inf": p_inf, "rf": p_rf, "rv": p_rv, "vol": p_vol, "crisis": p_cris})
+        with st.expander("Variables (Editables)", expanded=True):
+            # Usamos key= para vincular directamente al session_state actualizado
+            p_inf = st.number_input("Inflación (%)", key="in_inf", step=0.1)
+            p_rf = st.number_input("Retorno RF (%)", key="in_rf", step=0.1)
+            p_rv = st.number_input("Retorno RV (%)", key="in_rv", step=0.1)
+            p_vol = st.slider("Volatilidad RV", 10.0, 30.0, key="in_vol")
+            p_cris = st.slider("Prob. Crisis (%)", 0, 20, key="in_cris")
 
         st.divider()
         n_sims = st.slider("Simulaciones", 500, 5000, 1000)
         horiz = st.slider("Horizonte (Años)", 10, 60, 40)
         
-        # GOAL SEEK INTEGRADO
+        # --- GOAL SEEK (SIEMPRE VISIBLE PERO ACTIVO TRAS SIMULAR) ---
+        st.markdown("---")
+        st.markdown("### 🎯 Goal Seek")
+        
         if st.session_state.current_results:
-            st.markdown("---")
-            st.markdown("### 🎯 Goal Seek")
-            goal_type = st.selectbox("Objetivo:", ["Monto Retiro Mensual", "Duración (Años)"])
+            gs_type = st.selectbox("Objetivo:", ["Monto Retiro Mensual", "Duración (Años)"])
             target_prob = st.slider("Prob. Éxito Deseada", 50, 95, 90) / 100
-            if st.button("Calcular Objetivo"):
-                with st.spinner("Buscando..."):
-                    res = st.session_state.current_results
-                    val = goal_seek(target_prob, res["sim_obj"], "duration" if "Duración" in goal_type else "amount", 1, 100 if "Duración" in goal_type else res["inputs"][0]*0.01)
-                    if "Duración" in goal_type: st.success(f"El dinero dura: **{val:.0f} Años**")
-                    else: st.success(f"Gasto Máximo: **${fmt(val)}/mes**")
+            
+            if st.button("🔍 Calcular Objetivo"):
+                res = st.session_state.current_results
+                val = goal_seek(target_prob, res["sim_obj"], "duration" if "Duración" in gs_type else "amount", 1, 100 if "Duración" in gs_type else res["inputs"][0]*0.01)
+                
+                st.markdown("#### Resultado:")
+                if "Duración" in gs_type: 
+                    st.success(f"El dinero dura: **{val:.0f} Años**")
+                else: 
+                    st.success(f"Gasto Máx: **${fmt(val)}/mes**")
+        else:
+            st.info("Ejecuta la simulación primero para usar Goal Seek.")
 
-    # MAIN
+    # --- MAIN ---
     st.markdown("### 💰 Capital Inicial")
     ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
     if ini_def == 0: ini_def = 1800000000
@@ -259,7 +260,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     with c2: pct_rv = st.slider("% Renta Variable", 0, 100, 60)
     with c3: 
         st.metric("Mix", f"{100-pct_rv}% RF / {pct_rv}% RV")
-        st.caption(f"RF: {p_rf}% | RV: {p_rv}%")
+        st.caption(f"Retornos: RF {p_rf}% | RV {p_rv}%")
 
     st.markdown("### 💸 Plan de Retiro (Nominal)")
     g1, g2, g3 = st.columns(3)
@@ -267,10 +268,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     with g2: r2 = clean("Fase 2 ($)", 5500000, "r2"); d2 = st.number_input("Años", 13)
     with g3: r3 = clean("Fase 3 ($)", 5000000, "r3"); st.caption("Resto vida")
 
+    # BOTÓN FLOTANTE
     btn_run = st.button("🚀 EJECUTAR ANÁLISIS", type="primary")
 
     if btn_run:
-        # Construir Activos con volatilidad diferenciada
+        # Configurar simulador
         assets = [
             AssetBucket("RV", pct_rv/100, p_rv/100, p_vol/100),
             AssetBucket("RF", (100-pct_rv)/100, p_rf/100, 0.05)
@@ -283,10 +285,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap, n_sims=n_sims, inflation_mean=p_inf/100, prob_crisis=p_cris/100)
         
         sim = AdvancedSimulator(cfg, assets, wds)
-        # Correlación RV-RF (0.2)
-        sim.corr_matrix = np.array([[1.0, 0.2], [0.2, 1.0]])
+        sim.corr_matrix = np.array([[1.0, 0.2], [0.2, 1.0]]) # Correlación RV-RF
         
-        with st.spinner("Simulando Escenarios..."):
+        with st.spinner("Simulando..."):
             paths, cpi = sim.run()
             
             final_nom = paths[:, -1]
@@ -298,6 +299,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 "sim_obj": sim, "inputs": (cap, r1)
             }
 
+    # --- RESULTADOS ---
     if st.session_state.current_results:
         res = st.session_state.current_results
         
@@ -318,20 +320,22 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='#3b82f6', width=3), name='Mediana'))
         fig.add_trace(go.Scatter(x=y, y=p10, line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=y, y=p90, fill='tonexty', fillcolor='rgba(59, 130, 246, 0.1)', line=dict(width=0), name='Rango 80%'))
+        fig.update_layout(height=400, yaxis_title="Capital Nominal ($)", hovermode="x unified")
         st.plotly_chart(fig, use_container_width=True)
         
-        # OPTIMIZADOR AUTOMÁTICO (Recuperado)
+        # --- OPTIMIZADOR MIX (INTEGRADO) ---
         if res["succ"] < 99:
-            with st.expander("💡 Optimización de Portafolio", expanded=True):
+            st.markdown("### 💡 Optimización de Portafolio")
+            with st.expander("Ver Análisis de Frontera Eficiente", expanded=True):
                 st.write("Analizando qué combinación RV/RF maximiza tu éxito...")
-                df_opt = optimize_mix(res["sim_obj"], res["succ"])
+                df_opt = optimize_mix(res["sim_obj"])
                 best = df_opt.loc[df_opt["Prob"].idxmax()]
                 
                 c_opt1, c_opt2 = st.columns([2,1])
                 with c_opt1:
                     fig_opt = go.Figure()
                     fig_opt.add_trace(go.Scatter(x=df_opt["RV"], y=df_opt["Prob"]*100, mode='lines+markers'))
-                    fig_opt.update_layout(title="Curva de Eficiencia", xaxis_title="% Renta Variable", yaxis_title="Prob. Éxito %", height=250)
+                    fig_opt.update_layout(title="Probabilidad según % RV", xaxis_title="% Renta Variable", yaxis_title="Prob. Éxito %", height=250)
                     st.plotly_chart(fig_opt, use_container_width=True)
                 with c_opt2:
                     st.success(f"Mejor Mix: **{int(best['RV'])}% RV**")
