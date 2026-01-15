@@ -6,20 +6,16 @@ import re
 import json
 from datetime import date
 
-# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
-st.set_page_config(page_title="Diego Family Office", layout="wide", page_icon="🏛️")
+# --- 1. CONFIGURACIÓN ---
+st.set_page_config(page_title="Diego Family Office V30", layout="wide", page_icon="🏛️")
 
-# Inicializar Estado de Sesión (Memoria)
-if 'reporte_generado' not in st.session_state:
-    st.session_state.reporte_generado = False
-if 'resultados' not in st.session_state:
-    st.session_state.resultados = {}
+if 'reporte_generado' not in st.session_state: st.session_state.reporte_generado = False
+if 'resultados' not in st.session_state: st.session_state.resultados = {}
 
-# --- 2. ESTILOS CSS (BANKING GRADE) ---
+# --- 2. ESTILOS (BANKING GRADE) ---
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;700;800&family=Roboto+Mono:wght@400;500&display=swap');
-    
     body { font-family: 'Manrope', sans-serif; background-color: #f4f6f9; color: #1e293b; margin-bottom: 120px; }
     h1, h2, h3 { color: #0f172a; font-weight: 800; letter-spacing: -0.5px; }
     
@@ -27,13 +23,19 @@ st.markdown("""
         background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px;
         box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); transition: transform 0.2s;
     }
+    .metric-card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05); }
     .metric-title { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; color: #64748b; font-weight: 700; margin-bottom: 8px; }
-    .metric-value { font-family: 'Manrope', sans-serif; font-size: 2rem; font-weight: 800; color: #0f172a; }
+    .metric-value { font-family: 'Manrope', sans-serif; font-size: 1.8rem; font-weight: 800; color: #0f172a; }
     .metric-sub { font-size: 0.85rem; color: #94a3b8; margin-top: 4px; }
+    
+    .recommendation-card {
+        background-color: #f0fdf4; border-left: 4px solid #16a34a; padding: 15px; border-radius: 4px; margin-bottom: 10px;
+    }
+    .rec-title { font-weight: 700; color: #166534; font-size: 1rem; }
+    .rec-val { font-family: 'Roboto Mono', monospace; font-weight: 700; color: #15803d; }
     
     .positive { color: #10b981; } .negative { color: #ef4444; } .neutral { color: #f59e0b; }
     
-    /* Footer Fijo */
     .executive-footer {
         position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
         background: rgba(15, 23, 42, 0.95); color: white; backdrop-filter: blur(10px);
@@ -120,14 +122,78 @@ def proyeccion_montecarlo(n_sims, months, cap, g1, d1, g2, d2, g3, pct_rv, param
         
     return wealth, ruin_idx
 
-# --- 5. INTERFAZ ---
+# --- 5. MOTOR DE RECOMENDACIONES (INTELIGENCIA) ---
+def buscar_mejora(target_prob, base_prob, params_base, cap, g1, d1, g2, d2, g3, pct_rv, horizon_months):
+    """
+    Busca qué cambios logran aumentar la probabilidad de éxito en X puntos.
+    Retorna lista de sugerencias.
+    """
+    if base_prob >= 99.0: return []
+    
+    target = min(100.0, base_prob + 5.0) # Buscamos +5%
+    recs = []
+    
+    # 1. Reducir Gasto Fase 1
+    # Búsqueda binaria simple
+    low, high = 0, g1
+    best_g1 = g1
+    found = False
+    
+    # Intentamos 10 iteraciones para encontrar el G1 que da el target
+    for _ in range(10):
+        mid = (low + high) / 2
+        # Simulacion rápida (500 sims)
+        _, r_idx = proyeccion_montecarlo(500, horizon_months, cap, mid, d1, g2, d2, g3, pct_rv, params_base)
+        p = (np.sum(r_idx == -1) / 500) * 100
+        if p >= target:
+            best_g1 = mid
+            low = mid # Queremos el gasto más alto posible que cumpla
+            found = True
+        else:
+            high = mid # Necesitamos bajar más el gasto
+            
+    # Si logramos mejorar algo significativo
+    if found and best_g1 < g1:
+        delta = g1 - best_g1
+        recs.append({
+            "tipo": "Gasto Mensual",
+            "accion": f"Reducir Gasto Fase 1 en **$ {fmt(delta)}**",
+            "impacto": f"+5% Prob. Éxito"
+        })
 
-# Header
+    # 2. Inyección de Capital
+    # Cuánto capital extra necesito hoy
+    low_c, high_c = cap, cap * 1.5
+    best_cap = cap
+    found_c = False
+    for _ in range(10):
+        mid = (low_c + high_c) / 2
+        _, r_idx = proyeccion_montecarlo(500, horizon_months, mid, g1, d1, g2, d2, g3, pct_rv, params_base)
+        p = (np.sum(r_idx == -1) / 500) * 100
+        if p >= target:
+            best_cap = mid
+            high_c = mid # Queremos el capital mínimo necesario
+            found_c = True
+        else:
+            low_c = mid
+            
+    if found_c and best_cap > cap:
+        delta_c = best_cap - cap
+        recs.append({
+            "tipo": "Capital",
+            "accion": f"Inyectar Capital Hoy: **$ {fmt(delta_c)}**",
+            "impacto": f"+5% Prob. Éxito"
+        })
+        
+    return recs
+
+# --- 6. INTERFAZ ---
+
 c_logo, c_title = st.columns([1, 6])
 with c_logo: st.markdown("## 🏛️")
-with c_title: st.markdown("# Diego Family Office \n ### Informe de Solvencia Patrimonial")
+with c_title: st.markdown("# Diego Family Office \n ### Informe de Solvencia & Recomendaciones")
 
-# Sidebar
+# SIDEBAR
 with st.sidebar:
     st.markdown("### 1. Perfil")
     birth_year = st.number_input("Año Nacimiento", 1950, 2010, 1978)
@@ -152,6 +218,16 @@ with st.sidebar:
     else:
         cap_liq = input_dinero("Capital Líquido ($)", 1800000000, "c_man")
         pct_rv = st.slider("% Renta Variable", 0, 100, 60)/100.0
+    
+    # VISUALIZADOR DE MIX INMEDIATO
+    pct_rf = 1.0 - pct_rv
+    st.markdown("---")
+    st.markdown("### ⚖️ Mix de Inversión")
+    c_pie1, c_pie2 = st.columns(2)
+    c_pie1.metric("Renta Fija", f"{pct_rf*100:.0f}%")
+    c_pie2.metric("Renta Variable", f"{pct_rv*100:.0f}%")
+    st.progress(pct_rv)
+    st.caption("Barra indica % de Renta Variable (Riesgo)")
 
     st.markdown("### 3. Supuestos")
     with st.expander("Parámetros Macro"):
@@ -159,7 +235,7 @@ with st.sidebar:
         cost = st.number_input("Costos (%)", 1.0)/100
         guard = st.checkbox("Guardrails", True)
 
-# Inputs Gasto
+# INPUTS GASTO
 st.markdown("---")
 col_g1, col_g2, col_g3 = st.columns(3)
 with col_g1:
@@ -177,55 +253,69 @@ with col_g3:
 
 st.markdown("---")
 
-# --- LÓGICA DE EJECUCIÓN ---
+# EJECUCIÓN
 def ejecutar_simulacion():
     if cap_liq <= 0:
-        st.error("⚠️ Error: El Capital Líquido es 0. Por favor ingresa un monto manual o pega un JSON válido.")
+        st.error("⚠️ Error: Faltan datos de capital.")
         return
 
-    with st.spinner("Procesando escenarios..."):
+    with st.spinner("Analizando escenarios y buscando optimizaciones..."):
         params = {'r_rv': 0.075, 'v_rv': 0.18, 'r_rf': 0.035, 'v_rf': 0.05, 'corr': 0.8, 'inf': inf, 'cost': cost, 'guardrail': guard}
         months = max(12, horizon_years * 12)
         paths, ruin_idx = proyeccion_montecarlo(2000, months, cap_liq, g1, d1, g2, d2, g3, pct_rv, params)
         
-        # Guardar en sesión
+        prob = (np.sum(ruin_idx == -1) / 2000) * 100
+        
+        # Calcular Recomendaciones
+        recs = buscar_mejora(prob, prob, params, cap_liq, g1, d1, g2, d2, g3, pct_rv, months)
+        
         st.session_state.resultados = {
-            "paths": paths,
-            "ruin_idx": ruin_idx,
-            "months": months,
-            "cap": cap_liq
+            "paths": paths, "ruin_idx": ruin_idx, "months": months, "cap": cap_liq, 
+            "prob": prob, "recs": recs, "pct_rv": pct_rv
         }
         st.session_state.reporte_generado = True
 
-# BOTÓN DE LANZAMIENTO
 if st.button("🚀 GENERAR INFORME EJECUTIVO", type="primary", use_container_width=True):
     ejecutar_simulacion()
 
-# --- RENDERIZADO DEL REPORTE ---
 if st.session_state.reporte_generado:
     res = st.session_state.resultados
     paths = res["paths"]
     ruin_idx = res["ruin_idx"]
+    prob = res["prob"]
+    recs = res["recs"]
     
-    success_rate = (np.sum(ruin_idx == -1) / 2000) * 100
     median_legacy = np.median(paths[-1])
-    
     ruin_years = (ruin_idx[ruin_idx > -1] / 12) + age 
     risk_start = f"{np.percentile(ruin_years, 10):.0f} Años" if len(ruin_years) > 0 else "N/A"
     
-    # 1. KPIs
-    st.markdown("### 📊 Tablero de Control")
+    # KPIs
     k1, k2, k3, k4 = st.columns(4)
     with k1:
-        st.markdown(f"""<div class="metric-card"><div class="metric-title">Solvencia</div><div class="metric-value {'positive' if success_rate > 90 else 'negative'}">{success_rate:.1f}%</div><div class="metric-sub">Probabilidad Éxito</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="metric-card"><div class="metric-title">Solvencia</div><div class="metric-value {'positive' if prob > 90 else 'negative'}">{prob:.1f}%</div><div class="metric-sub">Probabilidad Éxito</div></div>""", unsafe_allow_html=True)
     with k2:
-        st.markdown(f"""<div class="metric-card"><div class="metric-title">Capital</div><div class="metric-value">${fmt(res['cap']/1e6)}M</div><div class="metric-sub">Activos Líquidos</div></div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div class="metric-card"><div class="metric-title">Capital</div><div class="metric-value">${fmt(res['cap']/1e6)}M</div><div class="metric-sub">{res['pct_rv']*100:.0f}% RV / {(1-res['pct_rv'])*100:.0f}% RF</div></div>""", unsafe_allow_html=True)
     with k3:
         st.markdown(f"""<div class="metric-card"><div class="metric-title">Herencia</div><div class="metric-value neutral">${fmt(median_legacy/1e6)}M</div><div class="metric-sub">Estimada P50</div></div>""", unsafe_allow_html=True)
     with k4:
         st.markdown(f"""<div class="metric-card"><div class="metric-title">Riesgo</div><div class="metric-value negative">{risk_start}</div><div class="metric-sub">Edad 1er Fallo</div></div>""", unsafe_allow_html=True)
 
-    # 2. GRÁFICO
+    # RECOMENDACIONES INTELIGENTES
+    if prob < 99.0 and len(recs) > 0:
+        st.markdown("### 💡 ¿Cómo mejorar mi plan?")
+        st.info(f"Para aumentar tu probabilidad de éxito en **5 puntos (al {min(100, prob+5):.1f}%)**, podrías considerar:")
+        
+        c_rec1, c_rec2 = st.columns(2)
+        for i, rec in enumerate(recs):
+            with (c_rec1 if i % 2 == 0 else c_rec2):
+                st.markdown(f"""
+                <div class="recommendation-card">
+                    <div class="rec-title">{rec['tipo']}</div>
+                    <div class="rec-val">{rec['accion']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    # GRÁFICO
     st.markdown("### 🔭 Proyección Patrimonial")
     years_axis = np.arange(res["months"] + 1) / 12 + age
     p10, p50, p90 = np.percentile(paths, 10, axis=1), np.percentile(paths, 50, axis=1), np.percentile(paths, 90, axis=1)
@@ -237,15 +327,9 @@ if st.session_state.reporte_generado:
     fig.update_layout(template="plotly_white", height=500, hovermode="x unified", xaxis=dict(title="Tu Edad"), yaxis=dict(tickformat=",.0f"))
     st.plotly_chart(fig, use_container_width=True)
 
-    # 3. TEXTO EJECUTIVO
-    st.markdown("### 📝 Executive Summary")
-    txt = f"**Estimado Diego:**\n\nTu plan tiene un **{success_rate:.1f}%** de probabilidad de éxito bajo las condiciones actuales."
-    if success_rate > 90: st.success(txt + "\n\n🟢 **Estado Sólido:** El capital actual es suficiente para cubrir los gastos proyectados con un alto margen de seguridad.")
-    elif success_rate > 75: st.warning(txt + f"\n\n🟡 **Atención Requerida:** Existe un riesgo moderado de agotar el capital a partir de los **{risk_start}**. Considera ajustar el gasto en Fase 1.")
-    else: st.error(txt + f"\n\n🔴 **Riesgo Crítico:** El plan no es sostenible a largo plazo. Se proyecta quiebra potencial a los **{risk_start}**. Se requiere inyección de capital o reducción drástica de gastos.")
-    
     # FOOTER
-    st.markdown(f"""<div class="executive-footer"><div class="footer-stat"><span>Solvencia</span><strong>{success_rate:.1f}%</strong></div><div class="footer-stat"><span>Herencia</span><strong>${fmt(median_legacy/1e6)}M</strong></div></div>""", unsafe_allow_html=True)
+    st.markdown(f"""<div class="executive-footer"><div class="footer-stat"><span>Solvencia</span><strong>{prob:.1f}%</strong></div><div class="footer-stat"><span>Herencia</span><strong>${fmt(median_legacy/1e6)}M</strong></div></div>""", unsafe_allow_html=True)
     
 elif cap_liq == 0:
-    st.info("👈 Ingresa tu capital (Manual o JSON) y presiona **GENERAR INFORME** para ver los resultados.")
+    st.info("👈 Ingresa tu capital y presiona **GENERAR INFORME**.")
+    
