@@ -15,7 +15,7 @@ st.markdown("""
     @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;700;800&family=Roboto+Mono:wght@400;500&display=swap');
     
     /* General */
-    body { font-family: 'Manrope', sans-serif; background-color: #f4f6f9; color: #1e293b; }
+    body { font-family: 'Manrope', sans-serif; background-color: #f4f6f9; color: #1e293b; margin-bottom: 100px; }
     h1, h2, h3 { color: #0f172a; font-weight: 800; letter-spacing: -0.5px; }
     
     /* Tarjetas Métricas (KPIs) */
@@ -40,6 +40,7 @@ st.markdown("""
         background: rgba(15, 23, 42, 0.95); color: white; backdrop-filter: blur(10px);
         padding: 12px 40px; border-radius: 50px; display: flex; gap: 40px;
         box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3); z-index: 9999;
+        white-space: nowrap;
     }
     .footer-stat { text-align: center; }
     .footer-stat span { display: block; font-size: 0.7rem; opacity: 0.7; text-transform: uppercase; }
@@ -56,19 +57,33 @@ def input_dinero(lbl, d, k): return parse(st.text_input(lbl, value=fmt(d), key=k
 def procesar_gems(json_raw):
     """Interpreta la cartera automáticamente."""
     try:
-        data = json_raw.get("registros", [{}])[0].get("instrumentos", []) if isinstance(json_raw, dict) else json_raw
+        # Detectar estructura (lista directa o diccionario con registros)
+        if isinstance(json_raw, dict) and "registros" in json_raw:
+            data = json_raw["registros"][0]["instrumentos"]
+        elif isinstance(json_raw, list):
+            data = json_raw
+        else:
+            return 0, 0, pd.DataFrame()
     except: return 0, 0, pd.DataFrame()
 
     total_rv, total_rf, total_liq = 0, 0, 0
     rows = []
-    kw_rv = ["agresivo", "fondo a", "equity", "accion", "etf", "sp500", "nasdaq"]
+    # Palabras clave ampliadas según tu JSON real
+    kw_rv = ["agresivo", "fondo a", "equity", "accion", "etf", "sp500", "nasdaq", "gestión activa", "moneda renta"]
     
     for i in data:
-        nom, tipo, saldo = i.get("nombre", "").lower(), i.get("tipo", "").lower(), i.get("saldo_clp", 0)
+        nom = i.get("nombre", "").lower()
+        tipo = i.get("tipo", "").lower()
+        sub = str(i.get("subtipo", "")).lower()
+        saldo = i.get("saldo_clp", 0)
+        
         if "pasivo" in tipo or "hipotecario" in nom: continue # Ignorar deuda
         
-        cat = "Renta Variable" if any(k in nom for k in kw_rv) else "Renta Fija"
-        if cat == "Renta Variable": total_rv += saldo
+        # Lógica de clasificación
+        es_rv = any(k in nom or k in sub for k in kw_rv)
+        cat = "Renta Variable" if es_rv else "Renta Fija"
+        
+        if es_rv: total_rv += saldo
         else: total_rf += saldo
         total_liq += saldo
         rows.append({"Activo": i.get("nombre"), "Monto": fmt(saldo), "Clase": cat})
@@ -108,8 +123,10 @@ def proyeccion_montecarlo(n_sims, months, cap, g1, d1, g2, d2, g3, pct_rv, param
         
         # Regla de Crisis (Guardrail)
         if params['guardrail']:
-            dd = (peak - wealth[t]) / peak
-            # Si cae más del 30%, recortamos gasto
+            with np.errstate(divide='ignore', invalid='ignore'):
+                dd = (peak - wealth[t]) / peak
+                dd = np.nan_to_num(dd)
+            
             mask_cut = (dd > 0.30) & mask_ok
             current_g = np.full(n_sims, target)
             current_g[mask_cut] -= 1200000 # Recorte duro
@@ -134,7 +151,8 @@ with c_title: st.markdown("# Diego Family Office \n ### Informe de Solvencia Pat
 # SIDEBAR: DATOS & SUPUESTOS
 with st.sidebar:
     st.markdown("### 1. Perfil del Cliente")
-    birth_year = st.number_input("Año de Nacimiento", 1980, 2005, 1982)
+    # CORRECCIÓN AQUÍ: Rango ampliado desde 1950 y default 1978
+    birth_year = st.number_input("Año de Nacimiento", 1950, 2010, 1978)
     current_year = date.today().year
     age = current_year - birth_year
     life_expectancy = st.slider("Esperanza de Vida (Planificación)", 85, 100, 95)
@@ -148,13 +166,16 @@ with st.sidebar:
     cap_liq, pct_rv = 0, 0.6
     
     if source == "Pegar JSON (Gems)":
-        txt = st.text_area("JSON Raw", height=100, placeholder="Pega aquí...")
+        txt = st.text_area("JSON Raw", height=150, placeholder="Pega el JSON de Gems aquí...")
         if txt:
             try:
                 c, p, df = procesar_gems(json.loads(txt))
                 cap_liq, pct_rv = c, p
-                st.success("✅ Datos sincronizados")
-            except: st.error("❌ Error en JSON")
+                if cap_liq > 0:
+                    st.success(f"✅ Carteras Procesadas ($ {fmt(cap_liq)})")
+                else:
+                    st.warning("JSON válido pero sin saldo líquido detectado")
+            except: st.error("❌ Error en formato JSON")
     else:
         cap_liq = input_dinero("Capital Líquido ($)", 1800000000, "man_cap")
         pct_rv = st.slider("% Renta Variable", 0, 100, 60)/100.0
@@ -196,22 +217,23 @@ if cap_liq > 0:
     # Simulación
     sims = 2000
     months = horizon_years * 12
+    # CORRECCIÓN: Asegurar que months > 0
+    if months <= 0: months = 12 
+    
     paths, ruin_idx = proyeccion_montecarlo(sims, months, cap_liq, g1, d1, g2, d2, g3, pct_rv, params)
     
     # KPIs
     success_rate = (np.sum(ruin_idx == -1) / sims) * 100
     median_legacy = np.median(paths[-1])
     
-    # Análisis de "Zona de Muerte" (¿Cuándo ocurre el riesgo?)
-    ruin_years = (ruin_idx[ruin_idx > -1] / 12) + age # Convertir meses a edad
+    # Análisis de "Zona de Muerte"
+    ruin_years = (ruin_idx[ruin_idx > -1] / 12) + age 
     
     risk_start_age = "N/A"
     most_dangerous_age = "N/A"
     
     if len(ruin_years) > 0:
-        # P10 de la ruina (el momento donde empieza el riesgo temprano)
         risk_start_age = f"{np.percentile(ruin_years, 10):.0f} Años"
-        # La moda (donde se concentra)
         most_dangerous_age = f"{int(np.median(ruin_years))} Años"
 
     # --- RENDERIZADO VISUAL ---
@@ -251,49 +273,34 @@ if cap_liq > 0:
             <div class="metric-sub">Edad de 1er fallo</div>
         </div>""", unsafe_allow_html=True)
 
-    # 2. GRÁFICO "CONO DE INCERTIDUMBRE" (Estilo Bloomberg)
+    # 2. GRÁFICO
     st.markdown("### 🔭 Proyección Patrimonial")
     
-    # Preparar datos
     years_axis = np.arange(months + 1) / 12 + age
     p10 = np.percentile(paths, 10, axis=1)
     p50 = np.percentile(paths, 50, axis=1)
     p90 = np.percentile(paths, 90, axis=1)
     
     fig = go.Figure()
-    
-    # Relleno P10-P90
     fig.add_trace(go.Scatter(
         x=np.concatenate([years_axis, years_axis[::-1]]),
         y=np.concatenate([p90, p10[::-1]]),
         fill='toself', fillcolor='rgba(148, 163, 184, 0.2)',
         line=dict(color='rgba(255,255,255,0)'),
-        name='Rango Probable (80% Casos)', hoverinfo="skip"
+        name='Rango 80%', hoverinfo="skip"
     ))
+    fig.add_trace(go.Scatter(x=years_axis, y=p50, line=dict(color='#0f172a', width=4), name='Mediana'))
+    fig.add_shape(type="line", x0=age, x1=age+horizon_years, y0=0, y1=0, line=dict(color="#ef4444", width=2, dash="dash"))
     
-    # Mediana
-    fig.add_trace(go.Scatter(
-        x=years_axis, y=p50,
-        line=dict(color='#0f172a', width=4),
-        name='Escenario Central'
-    ))
-    
-    # Línea de Ruina
-    fig.add_shape(type="line", x0=age, x1=age+horizon_years, y0=0, y1=0,
-                  line=dict(color="#ef4444", width=2, dash="dash"))
-    
-    # Configuración Ejes
     fig.update_layout(
-        template="plotly_white",
-        height=500,
-        hovermode="x unified",
+        template="plotly_white", height=500, hovermode="x unified",
         xaxis=dict(title="Tu Edad", showgrid=False),
         yaxis=dict(title="Patrimonio ($)", showgrid=True, gridcolor='#f1f5f9', tickformat=",.0f"),
         legend=dict(orientation="h", y=1.02, x=0.01)
     )
     st.plotly_chart(fig, use_container_width=True)
     
-    # 3. EXECUTIVE SUMMARY (Interpretación Automática)
+    # 3. EXECUTIVE SUMMARY
     st.markdown("### 📝 Executive Summary")
     
     analysis_text = f"""
@@ -303,11 +310,11 @@ if cap_liq > 0:
     """
     
     if success_rate > 95:
-        analysis_text += f"\n\n🟢 **Conclusión:** El plan es **excesivamente sólido**. Tienes capital excedente. Podrías aumentar tu gasto mensual en la Fase 1 o reducir tu exposición a Renta Variable para dormir más tranquilo."
+        analysis_text += f"\n\n🟢 **Conclusión:** El plan es **excesivamente sólido**. Tienes capital excedente. Podrías aumentar tu gasto mensual en la Fase 1 o reducir tu exposición a Renta Variable."
     elif success_rate > 80:
-        analysis_text += f"\n\n🟡 **Conclusión:** El plan es **viable pero requiere disciplina**. La zona de peligro comienza a los **{risk_start_age}**. Es crucial monitorear la inflación y mantener los costos de gestión bajos."
+        analysis_text += f"\n\n🟡 **Conclusión:** El plan es **viable pero requiere disciplina**. La zona de peligro comienza a los **{risk_start_age}**. Es crucial monitorear la inflación."
     else:
-        analysis_text += f"\n\n🔴 **Conclusión:** El plan presenta **riesgo estructural**. Existe una alta probabilidad de agotar la liquidez alrededor de los **{most_dangerous_age}**. Se recomienda urgentemente: 1) Reducir gasto Fase 1, 2) Postergar retiro total, o 3) Planificar la venta de activos inmobiliarios (Plan Z)."
+        analysis_text += f"\n\n🔴 **Conclusión:** El plan presenta **riesgo estructural**. Existe una alta probabilidad de agotar la liquidez alrededor de los **{most_dangerous_age}**. Se recomienda urgentemente ajustar gastos."
 
     st.info(analysis_text)
     
@@ -321,4 +328,4 @@ if cap_liq > 0:
     """, unsafe_allow_html=True)
 
 else:
-    st.warning("👈 Por favor carga los datos en la barra lateral para generar el informe.")
+    st.warning("👈 Carga los datos en la barra lateral (Pegar JSON o Manual) para generar el informe.")
