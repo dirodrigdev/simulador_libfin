@@ -332,4 +332,3 @@ if st.session_state.reporte_generado:
     
 elif cap_liq == 0:
     st.info("👈 Ingresa tu capital y presiona **GENERAR INFORME**.")
-    
