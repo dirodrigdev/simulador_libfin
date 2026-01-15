@@ -3,156 +3,258 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import re
+import json
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-st.set_page_config(page_title="Diego FIRE Control center", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="Diego FIRE Control V23", layout="wide", page_icon="🛡️")
 
 # --- ESTILOS CSS ---
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap');
-    body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
-    .main-card { background: white; padding: 25px; border-radius: 15px; border: 1px solid #e2e8f0; margin-bottom: 20px; }
-    .kpi-card { background: white; padding: 20px; border-radius: 12px; border: 1px solid #e2e8f0; text-align: center; border-top: 5px solid #3b82f6; }
-    .kpi-val { font-family: 'JetBrains Mono', monospace; font-size: 1.8rem; font-weight: 800; color: #0f172a; }
-    .kpi-lbl { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; color: #64748b; margin-top: 5px; }
-    .success { border-top-color: #10b981; }
-    .warning { border-top-color: #f59e0b; }
-    .danger { border-top-color: #ef4444; }
+    body { font-family: 'Inter', sans-serif; background-color: #f8fafc; margin-bottom: 120px; }
+    .main-card { background: white; padding: 25px; border-radius: 15px; border: 1px solid #e2e8f0; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); }
+    
+    /* Footer Flotante */
+    .floating-footer {
+        position: fixed; bottom: 0; left: 0; width: 100%;
+        background-color: #ffffff; border-top: 3px solid #cbd5e1;
+        box-shadow: 0px -4px 12px rgba(0,0,0,0.08); z-index: 9999;
+        padding: 12px 0px; display: flex; justify-content: center; align-items: center; gap: 40px;
+    }
+    .footer-item { text-align: center; min-width: 140px; }
+    .footer-label { font-size: 0.7rem; color: #64748b; text-transform: uppercase; font-weight: 700; }
+    .footer-value { font-size: 1.4rem; font-weight: 800; color: #0f172a; font-family: 'JetBrains Mono'; }
+    .status-green { color: #16a34a; } .status-yellow { color: #d97706; } .status-red { color: #dc2626; }
+    
+    /* Area de Texto para JSON */
+    .stTextArea textarea { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- UTILIDADES DE FORMATO ---
-def format_chile(valor):
-    """Convierte número a formato puntos: 1.800.000.000"""
-    return f"{int(valor):,}".replace(",", ".")
+def fmt(valor): return f"{int(valor):,}".replace(",", ".")
+def parse(texto): return int(re.sub(r'\D', '', texto)) if texto else 0
 
-def parse_chile(texto):
-    """Limpia el texto de puntos para volver a número"""
-    return int(re.sub(r'\D', '', texto)) if texto else 0
+def input_dinero(label, default, key, disabled=False):
+    val_str = st.text_input(label, value=fmt(default), key=key, disabled=disabled)
+    return parse(val_str)
 
-def input_dinero(label, default, key):
-    """Crea un campo de texto que simula entrada con puntos"""
-    val_str = st.text_input(label, value=format_chile(default), key=key)
-    return parse_chile(val_str)
+# --- CLASIFICADOR INTELIGENTE (JSON) ---
+def procesar_gems_json(data_raw):
+    """
+    Procesa el JSON pegado. Robusto a errores de estructura.
+    """
+    try:
+        # Detectar estructura (si es lista directa o dict con 'registros')
+        if isinstance(data_raw, dict) and "registros" in data_raw:
+             lista_instrumentos = data_raw["registros"][0]["instrumentos"]
+             fecha_dato = data_raw["registros"][0].get("fecha_dato", "N/A")
+        elif isinstance(data_raw, list):
+             lista_instrumentos = data_raw
+             fecha_dato = "Manual/Lista"
+        else:
+             return 0, 0, pd.DataFrame(), "Formato No Reconocido"
+    except:
+        return 0, 0, pd.DataFrame(), "Error Estructura"
+
+    total_rv = 0
+    total_rf = 0
+    total_clp_liquido = 0
+    df_rows = []
+    
+    # Palabras clave
+    kw_rv = ["agresivo", "fondo a", "gestión activa", "moneda renta", "equity", "accion", "etf", "sp500"]
+    
+    for item in lista_instrumentos:
+        nombre = item.get("nombre", "").lower()
+        tipo = item.get("tipo", "").lower()
+        subtipo = str(item.get("subtipo", "")).lower()
+        saldo = item.get("saldo_clp", 0)
+        
+        # 1. FILTRO DE PASIVOS
+        if "pasivo" in tipo or "hipotecario" in nombre:
+            df_rows.append({"Instrumento": item.get("nombre"), "Monto": fmt(saldo), "Categoría": "🔴 PASIVO (Excluido)"})
+            continue
+
+        # 2. CLASIFICACIÓN
+        es_rv = False
+        if any(k in nombre or k in subtipo for k in kw_rv): es_rv = True
+        
+        if es_rv:
+            total_rv += saldo
+            cat = "Renta Variable"
+        else:
+            total_rf += saldo
+            cat = "Renta Fija"
+            if "dolar" in nombre or "usd" in nombre: cat = "Caja/RF USD"
+        
+        total_clp_liquido += saldo
+        df_rows.append({"Instrumento": item.get("nombre"), "Monto": fmt(saldo), "Categoría": cat})
+        
+    pct_rv = total_rv / total_clp_liquido if total_clp_liquido > 0 else 0
+    return total_clp_liquido, pct_rv, pd.DataFrame(df_rows), fecha_dato
 
 # --- MOTOR MATEMÁTICO ---
-def generate_returns(n_sims, n_months, mu, sigma, df=5):
-    std_adj = np.sqrt((df - 2) / df) if df > 2 else 1.0
-    return mu + sigma * np.random.standard_t(df, (n_months, n_sims)) * std_adj
-
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("⚙️ Configuración Técnica")
+def simulacion_core(n_sims, months, cap_ini, inj_m, inj_a, g1, d1, g2, d2, g3, 
+                   alloc_rv, ret_rv, vol_rv, ret_rf, vol_rf, corr, use_guard, dd_trig, m_cut, drag):
     
-    with st.expander("📈 Mercado e Inflación", expanded=False):
-        n_sims = st.select_slider("Simulaciones", options=[1000, 2000, 5000], value=2000)
-        inflacion_anual = st.number_input("Inflación Anual (%)", value=3.5, step=0.1) / 100
-        drag_anual = st.number_input("Costos/Impuestos (%)", value=1.0, step=0.1) / 100
-        df_student = st.slider("Grados de Libertad (Crisis)", 3, 20, 5)
-
-    with st.expander("🎯 Riesgo y Retorno", expanded=True):
-        alloc_rv = st.slider("% Renta Variable", 0, 100, 60) / 100
-        ret_rv = st.number_input("Retorno RV Real (%)", value=6.5, step=0.1) / 100
-        vol_rv = st.number_input("Volatilidad RV (%)", value=18.0, step=0.1) / 100
-        ret_rf = st.number_input("Retorno RF Real (%)", value=1.5, step=0.1) / 100
-        vol_rf = st.number_input("Volatilidad RF (%)", value=5.0, step=0.1) / 100
-        correlacion = st.slider("Correlación en Crisis", 0.0, 1.0, 0.8)
-
-    with st.expander("🌪️ Reglas de Crisis", expanded=True):
-        use_guardrails = st.checkbox("Activar Recorte de Gasto", value=True)
-        dd_trigger = st.slider("Gatillo de Caída (%)", 10, 50, 30) / 100
-        # Recorte también con puntos
-        m_recorte = input_dinero("Monto Recorte ($)", 1200000, "rec_key")
-
-# --- CUERPO PRINCIPAL ---
-st.title("🛡️ Diego FIRE Control center")
-
-col_cap, col_inj = st.columns(2)
-with col_cap:
-    st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    cap_inicial = input_dinero("💰 Capital Líquido Inicial ($)", 1800000000, "cap_key")
-    st.markdown('</div>', unsafe_allow_html=True)
-with col_inj:
-    st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    inj_monto = input_dinero("💉 Inyección Futura ($)", 0, "inj_key")
-    inj_anio = st.number_input("Año de Inyección", value=10, min_value=1)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-st.markdown("### 💸 Plan de Gasto Mensual (Formato con puntos)")
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    g1 = input_dinero("Fase 1: Mensual ($)", 6000000, "g1_key")
-    d1 = st.number_input("Fase 1: Años", value=7, key="d1_key")
-    st.markdown('</div>', unsafe_allow_html=True)
-with c2:
-    st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    g2 = input_dinero("Fase 2: Mensual ($)", 5500000, "g2_key")
-    d2 = st.number_input("Fase 2: Años", value=13, key="d2_key")
-    st.markdown('</div>', unsafe_allow_html=True)
-with c3:
-    st.markdown('<div class="main-card">', unsafe_allow_html=True)
-    g3 = input_dinero("Fase 3: Mensual ($)", 5000000, "g3_key")
-    st.caption(f"Desde el año {d1+d2+1}")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# --- SIMULACIÓN ---
-if st.button("🚀 EJECUTAR ESCENARIOS", type="primary", use_container_width=True):
-    months = 40 * 12
-    mu_rv, mu_rf = (ret_rv - drag_anual)/12, (ret_rf - drag_anual)/12
-    sigma_rv, sigma_rf = vol_rv/np.sqrt(12), vol_rf/np.sqrt(12)
+    mu_rv, sigma_rv = (ret_rv-drag)/12, vol_rv/np.sqrt(12)
+    mu_rf, sigma_rf = (ret_rf-drag)/12, vol_rf/np.sqrt(12)
     
-    z1 = generate_returns(n_sims, months, 0, 1, df_student)
-    z2 = generate_returns(n_sims, months, 0, 1, df_student)
-    eps_rf = correlacion * z1 + np.sqrt(1 - correlacion**2) * z2
+    df = 5
+    std_adj = np.sqrt((df - 2) / df)
+    z1 = np.random.standard_t(df, (months, n_sims)) * std_adj
+    z2 = np.random.standard_t(df, (months, n_sims)) * std_adj
+    eps_rf = corr * z1 + np.sqrt(1 - corr**2) * z2
     
     wealth = np.zeros((months + 1, n_sims))
-    wealth[0] = cap_inicial
+    wealth[0] = cap_ini
+    peak = np.full(n_sims, cap_ini)
     is_fail = np.zeros(n_sims, dtype=bool)
-    peak = np.full(n_sims, cap_inicial)
     
     for t in range(1, months + 1):
         ret = (mu_rv + sigma_rv * z1[t-1]) * alloc_rv + (mu_rf + sigma_rf * eps_rf[t-1]) * (1 - alloc_rv)
         wealth[t] = wealth[t-1] * (1 + ret)
-        if t == inj_anio * 12: wealth[t] += inj_monto
-        if t == 36: wealth[t] -= 45000000 # Auto
+        
+        if t == inj_a * 12: wealth[t] += inj_m
+        if t == 36: wealth[t] -= 45000000 
         
         target = g1 if t <= d1*12 else (g2 if t <= (d1+d2)*12 else g3)
         peak = np.maximum(peak, wealth[t])
         
-        # Aplicamos recorte si drawdown > trigger
-        mask_crisis = (peak - wealth[t])/peak > dd_trigger
-        current_spend = np.full(n_sims, target)
-        if use_guardrails:
-            current_spend[mask_crisis] -= m_recorte
+        gasto_real = np.full(n_sims, target)
+        if use_guard and np.any((peak - wealth[t])/peak > dd_trig):
+            mask = (peak - wealth[t])/peak > dd_trig
+            gasto_real[mask] -= m_cut
             
-        wealth[t] -= current_spend
+        wealth[t] -= gasto_real
         wealth[t] = np.maximum(wealth[t], 0)
         is_fail |= (wealth[t] == 0)
+        
+    return wealth, is_fail
 
-    # --- RESULTADOS ---
-    res_liq = (1 - np.mean(is_fail)) * 100
-    med_final = np.median(wealth[-1])
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("⚙️ Configuración")
     
-    st.markdown("---")
-    k1, k2, k3 = st.columns(3)
-    k1.markdown(f'<div class="kpi-card {"success" if res_liq > 85 else "warning"}"><div class="kpi-val">{res_liq:.1f}%</div><div class="kpi-lbl">Éxito Líquido</div></div>', unsafe_allow_html=True)
-    k2.markdown(f'<div class="kpi-card danger"><div class="kpi-val">{np.mean(is_fail)*100:.1f}%</div><div class="kpi-lbl">Riesgo Plan Z</div></div>', unsafe_allow_html=True)
-    k3.markdown(f'<div class="kpi-card money"><div class="kpi-val">${format_chile(med_final)}</div><div class="kpi-lbl">Herencia Mediana (P50)</div></div>', unsafe_allow_html=True)
+    # SELECCIÓN DE MODO
+    modo_ingreso = st.radio("Fuente de Datos", ["Ingreso Manual", "Pegar JSON (Gems)"], index=0)
+    
+    json_data = None
+    if modo_ingreso == "Pegar JSON (Gems)":
+        st.info("Pega aquí el contenido de tu archivo JSON:")
+        txt_json = st.text_area("JSON Raw", height=200, placeholder='{"registros": [...] }')
+        if txt_json:
+            try:
+                json_data = json.loads(txt_json)
+                st.success("JSON procesado correctamente")
+            except:
+                st.warning("El texto no es un JSON válido aún.")
 
-    # Gráfico
+    with st.expander("📉 Mercado", expanded=False):
+        n_sims = st.select_slider("Simulaciones", [1000, 2000, 5000], value=2000)
+        drag = st.number_input("Costos (%)", 1.0) / 100
+    with st.expander("🌪️ Reglas de Crisis", expanded=False):
+        use_g = st.checkbox("Recortar Gasto", True)
+        dd_t = st.slider("Gatillo Caída (%)", 10, 50, 30) / 100
+        m_cut = input_dinero("Monto Recorte ($)", 1200000, "cut_k")
+    with st.expander("📊 Parametros RV/RF", expanded=False):
+        ret_rv = st.number_input("Retorno RV (%)", 6.5)/100
+        ret_rf = st.number_input("Retorno RF (%)", 1.5)/100
+        vol_rv = st.number_input("Volatilidad RV (%)", 18.0)/100
+        vol_rf = st.number_input("Volatilidad RF (%)", 5.0)/100
+        corr = st.number_input("Correlación", 0.8)
+
+# --- UI PRINCIPAL ---
+st.title("🛡️ Diego FIRE Control V23")
+
+# LÓGICA DE DATOS
+cap_final = 0
+alloc_final = 0.6
+
+if modo_ingreso == "Pegar JSON (Gems)" and json_data:
+    # MODO AUTOMÁTICO
+    cap_calc, alloc_calc, df_audit, fecha_json = procesar_gems_json(json_data)
+    cap_final = cap_calc
+    alloc_final = alloc_calc
+    
+    st.success(f"📂 **Datos Procesados**: Se detectaron instrumentos del **{fecha_json}**.")
+    
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown('<div class="main-card">', unsafe_allow_html=True)
+        st.metric("Capital Líquido (Sin Deuda)", f"$ {fmt(cap_final)}")
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col_b:
+        st.markdown('<div class="main-card">', unsafe_allow_html=True)
+        st.metric("Perfil de Riesgo (RV)", f"{alloc_final*100:.1f}%")
+        st.progress(alloc_final)
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+    with st.expander("🔍 Auditoría de Clasificación (Detalle)"):
+        st.dataframe(df_audit, use_container_width=True)
+        
+else:
+    # MODO MANUAL
+    col_cap, col_risk = st.columns(2)
+    with col_cap:
+        st.markdown('<div class="main-card">', unsafe_allow_html=True)
+        cap_final = input_dinero("💰 Capital Líquido Total ($)", 1800000000, "cap_manual")
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col_risk:
+        st.markdown('<div class="main-card">', unsafe_allow_html=True)
+        st.caption("⚖️ Asset Allocation")
+        alloc_final = st.slider("% Renta Variable", 0, 100, 60, key="slider_manual") / 100.0
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# GASTOS Y OTROS
+st.markdown("### 💸 Plan de Gasto")
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.markdown('<div class="main-card">', unsafe_allow_html=True)
+    g1 = input_dinero("Fase 1 ($)", 6000000, "g1")
+    d1 = st.number_input("Años Fase 1", 7)
+    st.markdown('</div>', unsafe_allow_html=True)
+with c2:
+    st.markdown('<div class="main-card">', unsafe_allow_html=True)
+    g2 = input_dinero("Fase 2 ($)", 5500000, "g2")
+    d2 = st.number_input("Años Fase 2", 13)
+    st.markdown('</div>', unsafe_allow_html=True)
+with c3:
+    st.markdown('<div class="main-card">', unsafe_allow_html=True)
+    g3 = input_dinero("Fase 3 ($)", 5000000, "g3")
+    st.caption("Resto de la vida")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# --- EJECUCIÓN ---
+if st.button("🚀 EJECUTAR ANÁLISIS", type="primary", use_container_width=True):
+    inj_m = 0 
+    inj_a = 10
+    
+    wealth, is_fail = simulacion_core(n_sims, 40*12, cap_final, inj_m, inj_a, g1, d1, g2, d2, g3,
+                                     alloc_final, ret_rv, vol_rv, ret_rf, vol_rf, corr, use_g, dd_t, m_cut, drag)
+    
+    prob = (1 - np.mean(is_fail)) * 100
+    herencia = np.median(wealth[-1])
+    riesgo = np.mean(is_fail) * 100
+    
+    # FOOTER
+    color = "status-green" if prob >= 90 else ("status-yellow" if prob >= 75 else "status-red")
+    st.markdown(f"""
+    <div class="floating-footer">
+        <div class="footer-item"><div class="footer-label">Éxito</div><div class="footer-value {color}">{prob:.1f}%</div></div>
+        <div class="footer-item"><div class="footer-label">Herencia P50</div><div class="footer-value">${fmt(herencia)}</div></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # GRÁFICO
     p10, p50, p90 = np.percentile(wealth, [10, 50, 90], axis=1)
     x = np.arange(len(p50))/12
     fig = go.Figure([
-        go.Scatter(x=x, y=p90, line=dict(width=0), showlegend=False, hoverinfo='skip'),
-        go.Scatter(x=x, y=p10, fill='tonexty', fillcolor='rgba(59,130,246,0.1)', name='Rango P10-P90'),
-        go.Scatter(x=x, y=p50, line=dict(color='#0f172a', width=3), name='Escenario Central')
+        go.Scatter(x=x, y=p90, line=dict(width=0), showlegend=False),
+        go.Scatter(x=x, y=p10, fill='tonexty', fillcolor='rgba(37, 99, 235, 0.1)', name='Rango'),
+        go.Scatter(x=x, y=p50, line=dict(color='#0f172a', width=3), name='Mediana')
     ])
-    fig.update_layout(
-        title="Evolución de Patrimonio", 
-        template="plotly_white", 
-        yaxis=dict(tickformat=",.0f", tickprefix="$ "),
-        hovermode="x unified"
-    )
+    fig.update_layout(template="plotly_white", yaxis=dict(tickformat=",.0f", tickprefix="$ "), hovermode="x unified", height=400)
     st.plotly_chart(fig, use_container_width=True)
