@@ -12,7 +12,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     # --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
     if 'current_results' not in st.session_state: st.session_state.current_results = None
     
-    # Escenarios
     SCENARIOS = {
         "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.5, "vol": 20.0, "crisis": 10},
         "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5},
@@ -20,7 +19,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         "Mis Datos 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
     }
 
-    # Inicializar inputs
     if "in_inf" not in st.session_state: st.session_state.in_inf = 3.0
     if "in_rf" not in st.session_state: st.session_state.in_rf = default_ret_rf
     if "in_rv" not in st.session_state: st.session_state.in_rv = default_ret_rv
@@ -37,14 +35,14 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             st.session_state.in_vol = vals["vol"]
             st.session_state.in_cris = vals["crisis"]
 
-    # --- 2. MOTOR MATEMÁTICO INSTITUCIONAL (V5.0) ---
+    # --- 2. MOTOR MATEMÁTICO ---
     @dataclass
     class AssetBucket:
         name: str
         weight: float = 0.0
         mu_nominal: float = 0.0
         sigma_nominal: float = 0.0
-        is_bond: bool = False # Flag para aplicar matemática de bonos (C)
+        is_bond: bool = False
 
     @dataclass
     class WithdrawalTramo:
@@ -63,10 +61,15 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         prob_crisis: float = 0.05
         crisis_drift: float = 0.75
         crisis_vol: float = 1.25
-        # NUEVOS PARÁMETROS (B, C, D)
-        use_fat_tails: bool = True     # (D) Distribución T-Student
-        use_mean_reversion: bool = True # (C) Bonos regresan a la media
-        use_guardrails: bool = True    # (B) Reglas de gasto dinámico
+        
+        # PARAMETROS AVANZADOS
+        use_fat_tails: bool = True
+        use_mean_reversion: bool = True
+        use_guardrails: bool = True
+        
+        # PARAMETRIZACIÓN DE GUARDRAILS (NUEVO)
+        guardrail_trigger: float = 0.15  # Caída del 15% activa el modo ahorro
+        guardrail_cut: float = 0.10      # Recorte del 10% del gasto
 
     class InstitutionalSimulator:
         def __init__(self, config, assets, withdrawals):
@@ -81,23 +84,16 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             capital_paths = np.zeros((n_sims, n_steps + 1)); capital_paths[:, 0] = self.cfg.initial_capital
             cpi_paths = np.ones((n_sims, n_steps + 1))
             
-            # Inicializar activos
             asset_values = np.zeros((n_sims, n_assets))
             for i, a in enumerate(self.assets): asset_values[:, i] = self.cfg.initial_capital * a.weight
 
-            # Cholesky
             try: L = np.linalg.cholesky(self.corr_matrix)
             except: L = np.eye(n_assets)
             
-            # Crisis (Régimen)
             p_crisis = 1 - (1 - self.cfg.prob_crisis)**self.dt
             in_crisis = np.zeros(n_sims, dtype=bool)
 
-            # (B) Guardrails: Estado de ajuste de inflación para cada simulación
-            # 1.0 = ajusta inflación normal, 0.0 = congela inflación este año
-            inflation_adjustment_factor = np.ones(n_sims)
-            
-            # Tracking del "High Water Mark" (Máximo valor alcanzado del portafolio real) para Guardrails
+            # Para Guardrails: Rastrear el "High Water Mark" (Máximo valor real histórico)
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
 
             for t in range(1, n_steps + 1):
@@ -110,57 +106,36 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 in_crisis = np.logical_or(in_crisis, new_c)
                 in_crisis[np.random.rand(n_sims) < 0.15] = False 
 
-                # 3. Generación de Shocks (D - FAT TAILS)
+                # 3. Shocks
                 if self.cfg.use_fat_tails:
-                    # T-Student con 5 grados de libertad (colas gordas típicas financieras)
-                    # Normalizamos para que la varianza sea 1 (std = sqrt(df/(df-2)))
-                    df = 5
-                    std_adj = np.sqrt((df-2)/df)
+                    df = 5; std_adj = np.sqrt((df-2)/df)
                     z_uncorr = np.random.standard_t(df, (n_sims, n_assets)) * std_adj
                 else:
                     z_uncorr = np.random.normal(0, 1, (n_sims, n_assets))
-                
                 z_corr = np.dot(z_uncorr, L.T)
                 
                 # 4. Evolución Activos
                 step_rets = np.zeros((n_sims, n_assets))
                 for i, asset in enumerate(self.assets):
                     mu, sig = asset.mu_nominal, asset.sigma_nominal
+                    if np.any(in_crisis): mu *= self.cfg.crisis_drift; sig *= self.cfg.crisis_vol
                     
-                    # Ajuste Crisis
-                    if np.any(in_crisis):
-                        mu *= self.cfg.crisis_drift
-                        sig *= self.cfg.crisis_vol
-                    
-                    # (C) MEAN REVERSION para Bonos (Ornstein-Uhlenbeck simplificado)
+                    # Mean Reversion para Bonos
                     if self.cfg.use_mean_reversion and asset.is_bond:
-                        # Si el retorno anterior fue muy alto, forzamos una corrección (drift negativo relativo)
-                        # Como no guardamos retornos pasados, usamos una aproximación simple de reversión a la media en el drift
-                        # Simplemente reducimos la volatilidad de la caminata aleatoria a largo plazo
-                        # (Implementación simplificada: Drift normal, pero choque amortiguado)
                         step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                     else:
-                        # Renta Variable (GBM estándar)
                         step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                 
                 asset_values *= np.exp(step_rets)
                 
-                # 5. Retiros con (B) GUARDRAILS
+                # 5. RETIROS & GUARDRAILS
                 total_cap = np.sum(asset_values, axis=1)
                 
-                # Actualizar High Water Mark (Real)
+                # Actualizar Máximo Histórico Real (High Water Mark)
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
                 
-                # Lógica Guardrail: Si el capital real cae > 20% desde el máximo, congelar inflación
-                if self.cfg.use_guardrails and t % 12 == 0:
-                    drawdown = (max_real_wealth - current_real_wealth) / max_real_wealth
-                    # Si caída > 20%, no ajustamos por inflación el próximo año (factor = 0 en el incremento)
-                    # Pero aquí simplificamos: si drawdown > 20%, usamos el retiro nominal del año pasado (no inflamos)
-                    # Para simplificar en el loop mensual:
-                    pass 
-
-                # Calcular Retiro Base
+                # Calcular Monto Base (Nominal sin ajuste aún)
                 year = t / 12
                 wd_base_start = 0
                 for w in self.withdrawals:
@@ -168,27 +143,28 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         wd_base_start = w.amount_nominal_monthly_start
                         break
                 
-                # Aplicar Guardrail al monto
                 if self.cfg.use_guardrails:
-                    # Si drawdown > 15%, usamos inflación retrasada (efecto "apretarse el cinturón")
+                    # Calcular Drawdown actual (Caída desde el máximo)
                     drawdown = (max_real_wealth - current_real_wealth) / max_real_wealth
-                    # Máscara de quienes están en problemas
-                    in_trouble = drawdown > 0.15
                     
-                    # Retiro Normal: Base * CPI actual
+                    # Si la caída es mayor al TRIGGER, aplicamos el CUT
+                    in_trouble = drawdown > self.cfg.guardrail_trigger
+                    
                     wd_nom = np.zeros(n_sims)
+                    # Caso Normal: Inflación completa
                     wd_nom[~in_trouble] = wd_base_start * cpi_paths[~in_trouble, t]
-                    # Retiro Ajustado: Base * CPI de hace un año (o congelado) -> Simplificado: 90% del retiro normal
-                    wd_nom[in_trouble] = (wd_base_start * cpi_paths[in_trouble, t]) * 0.90
+                    # Caso Guardrail Activado: Recorte % sobre el valor inflado
+                    # (Significa: "Debería retirar 100, pero retiro 90 por la crisis")
+                    wd_nom[in_trouble] = (wd_base_start * cpi_paths[in_trouble, t]) * (1.0 - self.cfg.guardrail_cut)
                 else:
                     wd_nom = np.full(n_sims, wd_base_start) * cpi_paths[:, t]
 
-                # Ejecutar Retiro
+                # Ejecutar retiro
                 ratio = np.divide(wd_nom, total_cap, out=np.zeros_like(total_cap), where=total_cap!=0)
                 ratio = np.clip(ratio, 0, 1)
                 asset_values *= (1 - ratio[:, np.newaxis])
                 
-                # 6. Rebalanceo Anual
+                # 6. Rebalanceo
                 if t % 12 == 0:
                     tot = np.sum(asset_values, axis=1)
                     alive = tot > 0
@@ -200,7 +176,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 
             return capital_paths, cpi_paths
 
-    # --- 3. TOOLS & HELPERS ---
     def clean(lbl, d, k): 
         v = st.text_input(lbl, value=f"{int(d):,}".replace(",", "."), key=k)
         return int(re.sub(r'\D', '', v)) if v else 0
@@ -230,16 +205,26 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             p_cris = st.slider("Prob. Crisis (%)", 0, 20, key="in_cris")
 
         st.divider()
-        st.markdown("### 🧠 Motor Institucional")
-        use_guard = st.checkbox("🛡️ Guardrails (Gasto Dinámico)", value=True, help="Si el portafolio cae >15%, reduce el retiro un 10%. (Punto B)")
-        use_fat = st.checkbox("📉 Fat Tails (Cisnes Negros)", value=True, help="Usa distribución T-Student para simular eventos extremos reales. (Punto D)")
-        use_bond = st.checkbox("📉 Bonos Reales (Mean Rev)", value=True, help="Evita que los bonos crezcan o caigan infinitamente. (Punto C)")
+        st.markdown("### 🧠 Configuración Institucional")
+        
+        # --- AQUÍ ESTÁ LA NUEVA PARAMETRIZACIÓN DE GUARDRAILS ---
+        use_guard = st.checkbox("🛡️ Guardrails (Gasto Dinámico)", value=True)
+        if use_guard:
+            # Inputs condicionales que aparecen solo si activas Guardrails
+            c_g1, c_g2 = st.columns(2)
+            gr_trigger = c_g1.number_input("Activar si cae (%)", value=15, step=5, help="Si el portafolio cae X% desde su máximo, se activa el recorte.")
+            gr_cut = c_g2.number_input("Recorte Gasto (%)", value=10, step=5, help="Porcentaje que reduces tu retiro mientras dure la crisis.")
+        else:
+            gr_trigger, gr_cut = 15, 10 # Defaults invisibles
+
+        use_fat = st.checkbox("📉 Fat Tails (Eventos Extremos)", value=True)
+        use_bond = st.checkbox("🔄 Bonos Reales (Mean Rev)", value=True)
         
         st.divider()
         n_sims = st.slider("Simulaciones", 500, 5000, 1000)
         horiz = st.slider("Horizonte (Años)", 10, 60, 40)
 
-    # MAIN LAYOUT
+    # MAIN
     st.markdown("### 💰 Capital Inicial")
     ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
     if ini_def == 0: ini_def = 1800000000
@@ -258,10 +243,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     with g3: r3 = clean("Fase 3 ($)", 5000000, "r3"); st.caption("Resto vida")
 
     if st.button("🚀 EJECUTAR ANÁLISIS PRO", type="primary"):
-        # Configurar activos con flag de Bonos
         assets = [
             AssetBucket("RV", pct_rv/100, p_rv/100, p_vol/100, is_bond=False),
-            AssetBucket("RF", (100-pct_rv)/100, p_rf/100, 0.05, is_bond=True) # RF marcada como bono
+            AssetBucket("RF", (100-pct_rv)/100, p_rf/100, 0.05, is_bond=True)
         ]
         wds = [
             WithdrawalTramo(0, d1, r1),
@@ -271,11 +255,12 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         cfg = SimulationConfig(
             horizon_years=horiz, initial_capital=cap, n_sims=n_sims, 
             inflation_mean=p_inf/100, prob_crisis=p_cris/100,
-            use_guardrails=use_guard, use_fat_tails=use_fat, use_mean_reversion=use_bond
+            use_guardrails=use_guard, use_fat_tails=use_fat, use_mean_reversion=use_bond,
+            # Pasamos los parámetros de usuario a la config
+            guardrail_trigger=gr_trigger/100.0, guardrail_cut=gr_cut/100.0
         )
         
         sim = InstitutionalSimulator(cfg, assets, wds)
-        # Correlación moderada
         sim.corr_matrix = np.array([[1.0, 0.25], [0.25, 1.0]])
         
         with st.spinner("Corriendo Montecarlo Institucional..."):
@@ -289,7 +274,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     if st.session_state.current_results:
         res = st.session_state.current_results
         
-        # DASHBOARD RESULTADOS
         clr = "#10b981" if res["succ"] > 90 else "#f59e0b" if res["succ"] > 75 else "#ef4444"
         st.markdown(f"""
         <div style="text-align:center; padding:20px; border:2px solid {clr}; border-radius:10px; margin-top:10px; background-color: rgba(0,0,0,0.02);">
@@ -298,11 +282,14 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         </div>
         """, unsafe_allow_html=True)
         
-        with st.expander("🔎 Análisis de Factores (Impacto de B, C, D)"):
+        with st.expander("🔎 Configuración de Seguridad"):
             c_a, c_b, c_c = st.columns(3)
-            c_a.info(f"🛡️ **Guardrails:** {'Activo' if use_guard else 'Inactivo'}. \n(Protege contra secuencias de malos retornos al inicio).")
-            c_b.info(f"📉 **Fat Tails:** {'Activo' if use_fat else 'Inactivo'}. \n(Simula crisis reales tipo 2008/COVID).")
-            c_c.info(f"🔄 **Bonos:** {'Mean Rev' if use_bond else 'Random Walk'}. \n(Evita comportamientos irreales en Renta Fija).")
+            if use_guard:
+                c_a.success(f"🛡️ **Guardrails:** Activo.\n(Si cae **{gr_trigger}%**, recortas **{gr_cut}%**).")
+            else:
+                c_a.warning("🛡️ **Guardrails:** Inactivo.")
+            c_b.info(f"📉 **Fat Tails:** {'Activo' if use_fat else 'Inactivo'}.")
+            c_c.info(f"🔄 **Bonos:** {'Mean Rev' if use_bond else 'Random Walk'}.")
 
         y = np.arange(res["paths"].shape[1])/12
         p10, p50, p90 = np.percentile(res["paths"], 10, axis=0), np.percentile(res["paths"], 50, axis=0), np.percentile(res["paths"], 90, axis=0)
