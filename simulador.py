@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dataclasses import dataclass, replace
+from typing import Optional
 import re
 
 # --- FUNCIÓN PRINCIPAL ---
@@ -51,6 +52,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         inflation_mean: float = 0.035; inflation_vol: float = 0.01; prob_crisis: float = 0.05
         crisis_drift: float = 0.75; crisis_vol: float = 1.25
         simple_mode: bool = False # Nuevo flag para modo optimista
+        random_seed: Optional[int] = None  # Para reproducibilidad
 
     class AdvancedSimulator:
         def __init__(self, config, assets, withdrawals):
@@ -61,6 +63,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             self.corr_matrix = np.eye(len(assets))
 
         def run(self):
+            # Usar Generator para reproducibilidad
+            rng = np.random.default_rng(self.cfg.random_seed)
+
             n_sims, n_steps, n_assets = self.cfg.n_sims, self.total_steps, len(self.assets)
             
             capital_paths = np.zeros((n_sims, n_steps + 1)); capital_paths[:, 0] = self.cfg.initial_capital
@@ -81,18 +86,19 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             in_crisis = np.zeros(n_sims, dtype=bool)
 
             for t in range(1, n_steps + 1):
-                # Inflación
-                inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
-                cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + inf_shock)
-                
+                # Inflación: usamos un factor multiplicativo log-normal (exp) para evitar CPI<=0
+                inf_shock = rng.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
+                cpi_paths[:, t] = cpi_paths[:, t-1] * np.exp(inf_shock)  # multiplicativo seguro
+
                 # Crisis
                 if not self.cfg.simple_mode:
-                    new_c = np.random.rand(n_sims) < p_crisis
+                    new_c = rng.random(n_sims) < p_crisis
                     in_crisis = np.logical_or(in_crisis, new_c)
-                    in_crisis[np.random.rand(n_sims) < 0.15] = False 
+                    # salida aleatoria de crisis con prob 0.15
+                    in_crisis[rng.random(n_sims) < 0.15] = False 
                 
                 # Retornos
-                z_uncorr = np.random.normal(0, 1, (n_sims, n_assets))
+                z_uncorr = rng.standard_normal((n_sims, n_assets))
                 z_corr = np.dot(z_uncorr, L.T)
                 
                 step_rets = np.zeros((n_sims, n_assets))
@@ -102,12 +108,12 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         mu *= self.cfg.crisis_drift
                         sig *= self.cfg.crisis_vol
                     
-                    # FÓRMULA CLAVE: (mu - 0.5*sig^2) es el crecimiento geométrico real
+                    # Fórmula GBM (mu y sig anualizados)
                     step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                 
                 asset_values *= np.exp(step_rets)
                 
-                # Retiros
+                # Retiros (indexados por CPI)
                 total_cap = np.sum(asset_values, axis=1)
                 year = t / 12
                 wd_base = 0
@@ -121,7 +127,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 ratio = np.clip(ratio, 0, 1)
                 asset_values *= (1 - ratio[:, np.newaxis])
                 
-                # Rebalanceo
+                # Rebalanceo anual
                 if t % 12 == 0:
                     tot = np.sum(asset_values, axis=1)
                     alive = tot > 0
@@ -192,8 +198,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         return pd.DataFrame(results)
 
     def clean(lbl, d, k): 
-        v = st.text_input(lbl, value=f"{int(d):,}".replace(",", "."), key=k)
-        return int(re.sub(r'\D', '', v)) if v else 0
+        # Cambiado a number_input para evitar parsing frágil
+        val = st.number_input(lbl, value=int(d), key=k, min_value=0, step=1000)
+        return int(val)
     def fmt(v): return f"{int(v):,}".replace(",", ".")
 
     # --- 4. UI ---
@@ -227,6 +234,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         n_sims = st.slider("Simulaciones", 500, 5000, 1000)
         horiz = st.slider("Horizonte (Años)", 10, 60, 40)
         
+        st.markdown("---")
+        st.markdown("### Reproducibilidad")
+        seed_in = st.number_input("Random seed (0 = aleatorio)", min_value=0, value=0, step=1)
+        seed_val = None if int(seed_in) == 0 else int(seed_in)
+
         st.markdown("---")
         st.markdown("### 🎯 Goal Seek")
         if st.session_state.current_results:
@@ -268,7 +280,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             WithdrawalTramo(d1, d1+d2, r2),
             WithdrawalTramo(d1+d2, horiz, r3)
         ]
-        cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap, n_sims=n_sims, inflation_mean=p_inf/100, prob_crisis=p_cris/100, simple_mode=use_simple)
+        cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap, n_sims=n_sims, inflation_mean=p_inf/100, prob_crisis=p_cris/100, simple_mode=use_simple, random_seed=seed_val)
         
         sim = AdvancedSimulator(cfg, assets, wds)
         sim.corr_matrix = np.array([[1.0, 0.2], [0.2, 1.0]])
@@ -295,7 +307,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             ka, kb, kc = st.columns(3)
             ka.metric("Retorno Nominal Promedio", f"{avg_nom:.1f}%")
             kb.metric("Retorno Real (Sin Inflación)", f"{real_rate:.1f}%", help="Nominal - Inflación")
-            kc.metric("Crecimiento Geométrico Real", f"~{geo_real:.1f}%", help="Lo que realmente crece tu dinero después de volatilidad.", delta="-Volatility Drag" if not use_simple else "Optimista")
+            kc.metric("Crecimiento Geométrico Real", f"~{geo_real:.1f}%", help="Lo que realmente crece tu dinero después de volatilidad.", delta="-Volatility Drag" if not use_simple else "Optim[...]" )
             
             if geo_real < 4.0 and not use_simple:
                 st.warning(f"⚠️ **Alerta Matemática:** Tu portafolio crece realmente al ~{geo_real:.1f}%, pero estás intentando retirar un 4-5%. Por eso la probabilidad baja al 60%.")
