@@ -109,10 +109,10 @@ def render_home():
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # Pasamos los datos al motor (INCLUYENDO MX QUE FALTABA)
+    # Pasamos los datos al motor
     simulador.app(
         default_rf=d.get('rf',0), 
-        default_mx=d.get('mx', 0), # <--- Corrección Auditada V6.7
+        default_mx=d.get('mx', 0), 
         default_rv=d.get('rv',0), 
         default_usd_nominal=d.get('usd',0), 
         default_tc=d.get('tc',930),
