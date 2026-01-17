@@ -44,24 +44,15 @@ class SimulationConfig:
     mu_global_rv: float = -0.35; mu_global_rf: float = -0.06; corr_global: float = 0.90   
     prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085  
 
-# --- 3. MOTOR V16 (NET RETURNS EDITION) ---
+# --- 3. MOTOR V16.3 (BUCKET PROTECTED) ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config; self.assets = assets; self.withdrawals = withdrawals
         self.dt = 1/config.steps_per_year; self.total_steps = int(config.horizon_years * config.steps_per_year)
-
-        # AJUSTE DIEGO: Rentabilidad ya es neta, eliminamos mu_drag.
-        self.mu_regimes = np.array([
-            [self.cfg.mu_normal_rv, self.cfg.mu_normal_rf], # Retorno directo sin descuentos
-            [self.cfg.mu_local_rv, self.cfg.mu_local_rf],
-            [self.cfg.mu_global_rv, self.cfg.mu_global_rf]
-        ])
-        
-        # Mantenemos vol_factor porque es una característica de riesgo/agilidad, no un costo.
+        self.mu_regimes = np.array([[self.cfg.mu_normal_rv, self.cfg.mu_normal_rf],[self.cfg.mu_local_rv, self.cfg.mu_local_rf],[self.cfg.mu_global_rv, self.cfg.mu_global_rf]])
         vol_factor = 0.80 if self.cfg.is_active_managed else 1.0
         base_sigma = np.array([[0.15, 0.05], [0.22, 0.12], [0.30, 0.14]])
         self.sigma_regimes = base_sigma * vol_factor
-        
         cn = np.array([[1.0, 0.35], [0.35, 1.0]]); self.L_normal = np.linalg.cholesky(cn)
         cl = np.clip(self.cfg.corr_local, -0.99, 0.99); self.L_local = np.linalg.cholesky(np.array([[1.0, cl], [cl, 1.0]]))
         cg = np.clip(self.cfg.corr_global, -0.99, 0.99); self.L_global = np.linalg.cholesky(np.array([[1.0, cg], [cg, 1.0]]))
@@ -91,16 +82,18 @@ class InstitutionalSimulator:
         for t in range(n_steps):
             alive = is_alive
             if np.any(alive):
+                # 1. RÉGIMENES
                 m0_alive = (current_regime == 0) & alive
                 if np.any(m0_alive):
                     r_ = np.random.rand(np.sum(m0_alive))
-                    new_l = r_ < self.p_norm_to_local; new_g = (r_ >= self.p_norm_to_local) & (r_ < (self.p_norm_to_local+self.p_norm_to_global))
-                    current_regime[np.where(m0_alive)[0][new_l]] = 1; current_regime[np.where(m0_alive)[0][new_g]] = 2
+                    current_regime[np.where(m0_alive)[0][r_ < self.p_norm_to_local]] = 1
+                    current_regime[np.where(m0_alive)[0][(r_ >= self.p_norm_to_local) & (r_ < (self.p_norm_to_local+self.p_norm_to_global))]] = 2
                 mc_alive = (current_regime > 0) & alive
                 if np.any(mc_alive):
                     r_ = np.random.rand(np.sum(mc_alive)); back = r_ < self.p_exit
                     current_regime[np.where(mc_alive)[0][back]] = 0
 
+                # 2. MERCADO
                 z_final.fill(0.0); z_t = Z_raw[:, t, :]
                 mask0 = (current_regime == 0) & alive; mask1 = (current_regime == 1) & alive; mask2 = (current_regime == 2) & alive
                 if np.any(mask0): z_final[mask0] = np.dot(z_t[mask0], self.L_normal.T)
@@ -113,17 +106,18 @@ class InstitutionalSimulator:
                 mus_t = self.mu_regimes[current_regime]; sigs_t = self.sigma_regimes[current_regime]
                 step_rets = (mus_t - 0.5 * sigs_t**2) * self.dt + (sigs_t * np.sqrt(self.dt) * z_final * path_defense[:, None])
                 asset_values[alive] *= np.exp(step_rets[alive])
-
                 cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + (inf_shocks[:, t] + (current_regime == 1)*0.003))
 
+                # 3. CASHFLOWS HITOS
                 if (t+1) % 12 == 0:
                     y_at = (t+1)//12
                     for evt in self.cfg.extra_cashflows:
                         if evt.year == y_at:
                             amt = evt.amount * cpi_paths[alive, t+1]
-                            tot = np.sum(asset_values[alive], axis=1, keepdims=True); tot[tot==0]=1.0
-                            asset_values[alive] += amt[:, None] * (asset_values[alive]/tot)
+                            # Inyectar/Sacar de RF primero si es posible
+                            asset_values[alive, rf_idx] += amt
 
+                # 4. GASTO Y GATILLO INMO
                 current_year = (t+1)/12; m_spend_nom = 0
                 for w in self.withdrawals:
                     if w.from_year <= current_year < w.to_year: m_spend_nom = w.amount_nominal_monthly_start * cpi_paths[:, t+1]; break
@@ -133,19 +127,27 @@ class InstitutionalSimulator:
                     asset_values[trig_mask, rf_idx] += self.cfg.net_inmo_value * cpi_paths[trig_mask, t+1]
                     has_house[trig_mask] = False
 
+                # 5. RETIRO INTELIGENTE (BUCKETING ACTIVO)
+                # No vendemos RV si el mercado está en crisis (>0) a menos que no quede RF
                 outflow = m_spend_nom + (self.cfg.enable_prop & (~has_house)) * (self.cfg.new_rent_cost * cpi_paths[:, t+1])
                 if self.cfg.use_guardrails:
                     real_w = np.sum(asset_values,1)/cpi_paths[:, t+1]
                     outflow[( (self.cfg.initial_capital - real_w)/self.cfg.initial_capital ) > 0.20] *= (1 - self.cfg.guardrail_cut)
                 
-                wd = np.minimum(outflow, np.sum(asset_values,1))
-                if self.cfg.use_smart_buckets:
-                    rf_b = np.maximum(asset_values[:, rf_idx], 0); t_rf = np.minimum(wd, rf_b)
-                    asset_values[:, rf_idx] -= t_rf; asset_values[:, rv_idx] -= (wd - t_rf)
-                else:
-                    rat = wd / np.maximum(np.sum(asset_values,1), 1.0)
-                    asset_values *= (1 - rat[:, None])
+                # Ejecutar retiro
+                total_cap = np.sum(asset_values, 1)
+                wd = np.minimum(outflow, total_cap)
+                
+                # Lógica de Cubos: RF primero siempre
+                rf_bal = np.maximum(asset_values[:, rf_idx], 0)
+                take_rf = np.minimum(wd, rf_bal)
+                asset_values[:, rf_idx] -= take_rf
+                
+                rem_wd = wd - take_rf
+                # El resto sale de RV
+                asset_values[:, rv_idx] -= rem_wd
 
+                # 6. ESTADO FINAL MES
                 asset_values = np.maximum(asset_values, 0); capital_paths[:, t+1] = np.sum(asset_values, 1)
                 dead = (capital_paths[:, t+1] <= 1000) & alive
                 if np.any(dead):
@@ -156,8 +158,9 @@ class InstitutionalSimulator:
 
 # --- 4. INTERFAZ ---
 def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000):
-    st.markdown("## 🦅 Panel de Decisión (V16.2 Sovereign Alpha - Net)")
-    
+    st.markdown("## 🦅 Panel de Decisión (V16.3 Bucket Protection)")
+    st.info("🚀 **Lógica de Protección:** El simulador ahora saca dinero **primero de la Renta Fija** y protege tu Renta Variable en tiempos de crisis.")
+
     SCENARIOS_GLOBAL = {
         "Colapso Sistémico (PÉSIMO)": {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.30},
         "Crash Financiero (Recomendado)": {"corr": 0.75, "rf_ret": -0.02, "rv_ret": -0.22},
@@ -178,7 +181,6 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
     with st.sidebar:
         st.header("⚙️ Configuración")
         is_active = st.toggle("Gestión Activa / Balanceados", value=True)
-        if is_active: st.caption("🛡️ Defensa táctica en crisis activada (Sin costos extra).")
         st.divider()
         sel_glo = st.selectbox("🌎 Crisis Global", list(SCENARIOS_GLOBAL.keys()), index=1)
         sel_loc = st.selectbox("🇨🇱 Crisis Local", list(SCENARIOS_LOCAL.keys()), index=1)
@@ -200,7 +202,7 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
         with c2: pct_rv_user = st.slider("Motor (RV)", 0, 100, int(pct_rv_input))
         with c3: st.metric("Mix", f"{100-pct_rv_user}% Def / {pct_rv_user}% Mot")
         
-        st.subheader("2. Gastos y Hitos")
+        st.subheader("2. Gastos e Hitos")
         g1, g2, g3 = st.columns(3)
         with g1: r1 = clean_input("Fase 1", 6000000, "r1"); d1 = st.number_input("Años F1", 0, 40, 7)
         with g2: r2 = clean_input("Fase 2", 5500000, "r2"); d2 = st.number_input("Años F2", 0, 40, 13)
@@ -241,4 +243,4 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
             fig.update_layout(title="Evolución Patrimonio", template="plotly_dark"); st.plotly_chart(fig, use_container_width=True)
 
     with tab_opt:
-        st.write("Optimización lista para motor V16.2.")
+        st.write("Optimización lista para motor V16.3.")
