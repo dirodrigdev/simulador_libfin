@@ -2,7 +2,7 @@ import streamlit as st
 import json
 import os
 import pandas as pd
-import simulador 
+import simulador  # Asegúrate de que simulador.py tenga el código V7 Sovereign Grade
 
 st.set_page_config(page_title="Gestión Patrimonial", layout="wide", page_icon="🏦")
 
@@ -51,8 +51,8 @@ valor_prop_uf_default = 14500
 deuda_hipo_clp_default = 0
 
 if df_cartera is not None and not df_cartera.empty:
-    deuda_hipo_uf = df_cartera[df_cartera["bucket_sim"] == "PASIVO"]["saldo_nominal"].sum() # Pasivo viene del bucket ahora
-    if deuda_hipo_uf == 0: # Fallback al tipo original si falla bucket
+    deuda_hipo_uf = df_cartera[df_cartera["bucket_sim"] == "PASIVO"]["saldo_nominal"].sum()
+    if deuda_hipo_uf == 0: 
          deuda_hipo_uf = df_cartera[df_cartera["tipo"] == "Pasivo Inmobiliario"]["saldo_nominal"].sum()
     deuda_hipo_clp_default = deuda_hipo_uf * uf_val
 
@@ -90,13 +90,26 @@ def render_home():
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # LLAMADA CORRECTA A SIMULADOR
+    
+    # --- CONSOLIDACIÓN PARA MODELO V7 ---
+    # La nueva tesis agrupa todo lo defensivo (RF + Mixto + USD) vs Motor (RV)
+    
+    # 1. Calcular saldos
+    saldo_rf = d.get('rf', 0)
+    saldo_mx = d.get('mx', 0)
+    saldo_usd_clp = d.get('usd', 0) * d.get('tc', 930)
+    
+    # 2. Asignar a Buckets V7
+    # DEFENSA: Sumamos RF pura + Mixto (asumimos componente defensivo) + Caja USD
+    total_defensa = saldo_rf + saldo_mx + saldo_usd_clp
+    
+    # MOTOR: Renta Variable Pura
+    total_motor = d.get('rv', 0)
+
+    # 3. LLAMADA AL SIMULADOR V7 (Solo 3 argumentos clave)
     simulador.app(
-        default_rf=d.get('rf',0), 
-        default_mx=d.get('mx', 0), 
-        default_rv=d.get('rv',0), 
-        default_usd_nominal=d.get('usd',0), 
-        default_tc=d.get('tc',930),
+        default_rf=total_defensa,      # Pasa todo el bloque defensivo
+        default_rv=total_motor,        # Pasa el bloque de riesgo
         default_inmo_neto=d.get('inmo_neto', 0)
     )
 
