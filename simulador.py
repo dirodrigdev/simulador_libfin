@@ -5,7 +5,6 @@ import plotly.graph_objects as go
 from dataclasses import dataclass
 import re
 
-# --- FUNCIÓN PRINCIPAL ---
 def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default_tc=930, default_ret_rf=6.0, default_ret_rv=10.0, default_inmo_neto=0):
     
     if 'current_results' not in st.session_state: st.session_state.current_results = None
@@ -46,7 +45,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         horizon_years: int = 40; steps_per_year: int = 12; initial_capital: float = 1_000_000; n_sims: int = 2000
         inflation_mean: float = 0.035; inflation_vol: float = 0.01; prob_crisis: float = 0.05
         crisis_drift: float = 0.85; crisis_vol: float = 1.25
-        use_fat_tails: bool = True; use_mean_reversion: bool = True; use_guardrails: bool = True
+        use_fat_tails: bool = True; use_guardrails: bool = True
         guardrail_trigger: float = 0.15; guardrail_cut: float = 0.10
         use_smart_buckets: bool = True 
         sell_year: int = 0; net_inmo_value: float = 0; new_rent_cost: float = 0
@@ -73,23 +72,18 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             try: L = np.linalg.cholesky(self.corr_matrix)
             except: L = np.eye(n_assets)
 
-            # ÍNDICES DINÁMICOS
+            # --- INDICES DINÁMICOS ---
             try: rv_idx = next(i for i, a in enumerate(self.assets) if not a.is_bond)
             except StopIteration: rv_idx = 0
             try: rf_idx = next(i for i, a in enumerate(self.assets) if a.is_bond)
             except StopIteration: rf_idx = 1
-            
-            # EXCLUSIÓN MUTUA FAT TAILS VS CRISIS
-            p_crisis_manual = 1 - (1 - self.cfg.prob_crisis)**self.dt
-            use_crisis_vol = not self.cfg.use_fat_tails
+
+            if self.cfg.use_fat_tails: p_crisis = 0.0 
+            else: p_crisis = 1 - (1 - self.cfg.prob_crisis)**self.dt
             
             in_crisis = np.zeros(n_sims, dtype=bool)
+            shadow_rv_index = np.ones(n_sims); shadow_rv_peak = np.ones(n_sims)
             
-            # SHADOW BENCHMARK
-            shadow_rv_index = np.ones(n_sims) 
-            shadow_rv_peak = np.ones(n_sims)  
-            
-            # ANUALIDAD
             annuity_monthly_payout_real = 0
             if self.cfg.sell_year > 0 and self.cfg.inmo_strategy == 'annuity':
                 years_remaining = self.cfg.horizon_years - self.cfg.sell_year
@@ -101,25 +95,21 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         annuity_monthly_payout_real = self.cfg.net_inmo_value * (r_monthly * factor) / (factor - 1)
                     else: annuity_monthly_payout_real = self.cfg.net_inmo_value / months
 
-            # Estado para Mean Reversion
-            rf_drift_state = np.zeros(n_sims) 
-
-            # FIX: Inicializar max_real_wealth FUERA del loop
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
 
             for t in range(1, n_steps + 1):
                 # 1. Inflación
                 inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
-                inf_shock = np.maximum(inf_shock, -0.99) 
+                inf_shock = np.maximum(inf_shock, -0.99)
                 cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + inf_shock)
                 
-                # 2. Crisis Script
-                if p_crisis_manual > 0:
-                    new_c = np.random.rand(n_sims) < p_crisis_manual
+                # 2. Crisis
+                if p_crisis > 0:
+                    new_c = np.random.rand(n_sims) < p_crisis
                     in_crisis = np.logical_or(in_crisis, new_c)
                     in_crisis[np.random.rand(n_sims) < 0.15] = False
 
-                # 3. Retornos
+                # 3. Retornos (Browniano Estándar - Sin Inestabilidad)
                 if self.cfg.use_fat_tails:
                     df = 5; std_adj = np.sqrt((df-2)/df)
                     z_uncorr = np.random.standard_t(df, (n_sims, n_assets)) * std_adj
@@ -129,44 +119,33 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 step_rets = np.zeros((n_sims, n_assets))
                 for i, asset in enumerate(self.assets):
                     mu, sig = asset.mu_nominal, asset.sigma_nominal
-                    
-                    if p_crisis_manual > 0 and np.any(in_crisis): 
+                    if p_crisis > 0 and np.any(in_crisis): 
                         mu *= self.cfg.crisis_drift 
-                        if use_crisis_vol: sig *= self.cfg.crisis_vol
-                    
-                    if self.cfg.use_mean_reversion and asset.is_bond:
-                        kappa = 1.0 
-                        mr_adj = -kappa * rf_drift_state * self.dt
-                        step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i] + mr_adj
-                        rf_drift_state += z_corr[:, i] * np.sqrt(self.dt) 
-                    else:
-                        step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
+                        if not self.cfg.use_fat_tails: sig *= self.cfg.crisis_vol
+                    step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
 
                 asset_values *= np.exp(step_rets)
                 
-                # SHADOW BENCHMARK UPDATE
+                # Shadow Benchmark
                 shadow_rv_index *= np.exp(step_rets[:, rv_idx])
                 shadow_rv_peak = np.maximum(shadow_rv_peak, shadow_rv_index)
                 market_drawdown = (shadow_rv_peak - shadow_rv_index) / shadow_rv_peak
-                is_market_crash = market_drawdown > 0.15 
-                sim_in_trouble = np.logical_or(in_crisis, is_market_crash)
+                sim_in_trouble = np.logical_or(in_crisis, market_drawdown > 0.15)
 
                 spy = self.cfg.steps_per_year
                 current_year = t / spy
 
-                # 4. EVENTO VENTA
+                # 4. Venta Casa
                 if self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * spy):
                     if self.cfg.inmo_strategy == 'portfolio':
                         injection = self.cfg.net_inmo_value * cpi_paths[:, t]
                         asset_values[:, 0] += injection 
 
                 total_cap = np.sum(asset_values, axis=1)
-                
-                # FIX: Actualizar max_real_wealth DENTRO del loop
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
 
-                # 5. GESTIÓN FLUJO
+                # 5. Flujos
                 living_base = 0
                 for w in self.withdrawals:
                     if w.from_year <= current_year < w.to_year:
@@ -174,10 +153,10 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 
                 living_nom = np.zeros(n_sims)
                 if self.cfg.use_guardrails:
-                    drawdown_port = (max_real_wealth - current_real_wealth) / max_real_wealth
-                    in_trouble_guard = drawdown_port > self.cfg.guardrail_trigger
-                    living_nom[~in_trouble_guard] = living_base * cpi_paths[~in_trouble_guard, t]
-                    living_nom[in_trouble_guard] = (living_base * cpi_paths[in_trouble_guard, t]) * (1.0 - self.cfg.guardrail_cut)
+                    dd_port = (max_real_wealth - current_real_wealth) / max_real_wealth
+                    in_trouble_g = dd_port > self.cfg.guardrail_trigger
+                    living_nom[~in_trouble_g] = living_base * cpi_paths[~in_trouble_g, t]
+                    living_nom[in_trouble_g] = (living_base * cpi_paths[in_trouble_g, t]) * (1.0 - self.cfg.guardrail_cut)
                 else: living_nom = np.full(n_sims, living_base) * cpi_paths[:, t]
 
                 rent_nom = np.zeros(n_sims)
@@ -191,24 +170,20 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 debug_net_flow[t] = np.median(net_cashflow)
                 portfolio_adjustment = -net_cashflow 
                 
-                # Caso 1: Reinversión (Superávit)
+                # Gestión de Saldos
                 mask_surplus = portfolio_adjustment <= 0
                 if np.any(mask_surplus):
                     surplus = -portfolio_adjustment[mask_surplus]
                     for i, asset in enumerate(self.assets):
                         asset_values[mask_surplus, i] += surplus * asset.weight
 
-                # Caso 2: Déficit (Retiro)
                 mask_deficit = portfolio_adjustment > 0
                 if np.any(mask_deficit):
                     wd_req = portfolio_adjustment[mask_deficit]
-                    
                     if self.cfg.use_smart_buckets:
                         rf_bal = np.maximum(asset_values[mask_deficit, rf_idx], 0)
-                        
                         take_rf = np.minimum(wd_req, rf_bal)
                         take_rv = wd_req - take_rf 
-                        
                         asset_values[mask_deficit, rf_idx] -= take_rf
                         asset_values[mask_deficit, rv_idx] -= take_rv
                     else:
@@ -216,9 +191,8 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         ratio_d = np.divide(wd_req, tot_d, out=np.zeros_like(tot_d), where=tot_d!=0)
                         asset_values[mask_deficit] *= (1 - ratio_d[:, np.newaxis])
 
-                # 6. REBALANCEO
+                # 6. Rebalanceo
                 is_sale_event = (self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * spy))
-                
                 if (t % spy == 0) or is_sale_event:
                     if self.cfg.use_smart_buckets:
                         rebalance_mask = ~sim_in_trouble 
@@ -289,10 +263,10 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
         st.divider()
         st.markdown("### 🧠 Seguridad")
-        use_smart = st.checkbox("🥛 Smart Buckets", value=True, help="Prioriza sacar de Renta Fija. Si se agota, saca de Variable.")
+        use_smart = st.checkbox("🥛 Smart Buckets", value=True, help="Prioriza sacar de RF.")
         use_guard = st.checkbox("🛡️ Guardrails", value=True)
         use_fat = st.checkbox("📉 Fat Tails", value=True)
-        use_bond = st.checkbox("🔄 Bonos Reales", value=True, help="Activa reversión a la media en Renta Fija.")
+        # Eliminado Bonos Reales para evitar inestabilidad
         
         if use_guard:
             c1, c2 = st.columns(2)
@@ -302,7 +276,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         n_sims = st.slider("Sims", 500, 5000, 1000)
         horiz = st.slider("Horizonte", 10, 60, 40)
 
-    # MAIN
     st.markdown("### 💰 Capital Inversión")
     ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
     if ini_def == 0: ini_def = 1800000000
@@ -312,7 +285,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         cap_input = clean("Capital Líquido ($)", ini_def, "cap")
         if sell_prop and inmo_strat_code == 'portfolio': st.success(f"Año {sale_year}: +${fmt(net_inmo_val)}")
     
-    # MIX SLIDERS
     has_mx = default_mx > 0
     with c2: 
         if has_mx:
@@ -349,7 +321,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, 
             inflation_mean=p_inf/100, prob_crisis=p_cris/100,
             use_guardrails=use_guard, guardrail_trigger=gr_trigger/100.0, guardrail_cut=gr_cut/100.0,
-            use_fat_tails=use_fat, use_mean_reversion=use_bond,
+            use_fat_tails=use_fat, use_mean_reversion=False, # Desactivado por seguridad
             use_smart_buckets=use_smart,
             sell_year=sale_year, net_inmo_value=net_inmo_val, new_rent_cost=rent_cost,
             inmo_strategy=inmo_strat_code, annuity_rate=annuity_rate_ui/100.0
@@ -358,7 +330,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         sim = InstitutionalSimulator(cfg, assets, wds)
         sim.corr_matrix = np.array([[1.0, 0.25], [0.25, 1.0]])
         
-        with st.spinner("Procesando Lógica Institucional Auditada..."):
+        with st.spinner("Procesando Simulación Estable..."):
             paths, cpi, ruin_idx, annuity_val, deb_net = sim.run()
             final_nom = paths[:, -1]
             success = np.mean(final_nom > 0) * 100
@@ -394,7 +366,12 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             c3.metric("Flujo Inmobiliario Neto", f"${fmt(delta_cash)}/mes", delta="Superávit" if delta_cash > 0 else "Déficit")
 
         y = np.arange(res["paths"].shape[1])/12
-        p10, p50, p90 = np.percentile(res["paths"], 10, axis=0), np.percentile(res["paths"], 50, axis=0), np.percentile(res["paths"], 90, axis=0)
+        # Limpieza de visualización para evitar que valores infinitos rompan el gráfico
+        paths_clean = np.clip(res["paths"], 0, np.percentile(res["paths"][:,-1], 95) * 1.5)
+        
+        p10 = np.percentile(paths_clean, 10, axis=0)
+        p50 = np.percentile(paths_clean, 50, axis=0)
+        p90 = np.percentile(paths_clean, 90, axis=0)
         
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='#3b82f6', width=3), name='Patrimonio (Mediana)'))
