@@ -44,7 +44,7 @@ class SimulationConfig:
     mu_global_rv: float = -0.35; mu_global_rf: float = -0.06; corr_global: float = 0.90   
     prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085  
 
-# --- 3. MOTOR V16.5 (BUCKET PROTECTED + OPTIMIZER CORE) ---
+# --- 3. MOTOR V16.6 ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config; self.assets = assets; self.withdrawals = withdrawals
@@ -80,8 +80,6 @@ class InstitutionalSimulator:
         for t in range(n_steps):
             alive = is_alive
             if not np.any(alive): break
-            
-            # Markov
             m0 = (current_regime == 0) & alive
             if np.any(m0):
                 r_ = np.random.rand(np.sum(m0))
@@ -91,7 +89,6 @@ class InstitutionalSimulator:
             if np.any(mc):
                 r_ = np.random.rand(np.sum(mc)); current_regime[np.where(mc)[0][r_ < self.p_exit]] = 0
 
-            # Mercado con Protección Táctica
             z_t = Z_raw[:, t, :]
             mask0, mask1, mask2 = (current_regime==0)&alive, (current_regime==1)&alive, (current_regime==2)&alive
             if np.any(mask0): z_final[mask0] = np.dot(z_t[mask0], self.L_normal.T)
@@ -103,13 +100,11 @@ class InstitutionalSimulator:
             asset_values[alive] *= np.exp((mus_t[alive]-0.5*sigs_t[alive]**2)*self.dt + sigs_t[alive]*np.sqrt(self.dt)*z_final[alive]*p_def[alive, None])
             cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + (inf_shocks[:, t] + (current_regime == 1)*0.003))
 
-            # Cashflows extraordinarios
             if (t+1) % 12 == 0:
                 y = (t+1)//12
                 for evt in self.cfg.extra_cashflows:
                     if evt.year == y: asset_values[alive, rf_idx] += evt.amount * cpi_paths[alive, t+1]
 
-            # Gastos y Gatillo Inmobiliario
             cur_y = (t+1)/12; m_spend = 0
             for w in self.withdrawals:
                 if w.from_year <= cur_y < w.to_year: m_spend = w.amount_nominal_monthly_start * cpi_paths[:, t+1]; break
@@ -118,7 +113,6 @@ class InstitutionalSimulator:
             if np.any(trig):
                 asset_values[trig, rf_idx] += self.cfg.net_inmo_value * cpi_paths[trig, t+1]; has_house[trig] = False
 
-            # Retiro Estratégico (Prioridad RF)
             out = m_spend + (self.cfg.enable_prop & (~has_house)) * (1500000 * cpi_paths[:, t+1])
             if self.cfg.use_guardrails:
                 out[( (self.cfg.initial_capital - np.sum(asset_values,1)/cpi_paths[:, t+1])/self.cfg.initial_capital ) > 0.20] *= (1 - self.cfg.guardrail_cut)
@@ -138,12 +132,11 @@ class InstitutionalSimulator:
 def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000):
     st.markdown("## 🦅 Panel de Decisión Patrimonial")
     
-    # Escenarios Transparentes
     SCENARIOS_RENTABILIDAD = {
         "Conservador": {"rv": 0.08, "rf": 0.045, "label": "RV 8.0% | RF 4.5%"},
         "Histórico (Recomendado)": {"rv": 0.11, "rf": 0.06, "label": "RV 11.0% | RF 6.0%"},
         "Crecimiento (Optimista)": {"rv": 0.13, "rf": 0.07, "label": "RV 13.0% | RF 7.0%"},
-        "Personalizado": {"rv": 0.0, "rf": 0.0, "label": "Definir manualmente"}
+        "Personalizado": {"rv": 0.0, "rf": 0.0, "label": "Manual"}
     }
     
     SCENARIOS_GLOBAL = {
@@ -168,21 +161,19 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
         else:
             chosen_mu_rv = SCENARIOS_RENTABILIDAD[sel_ret]["rv"]
             chosen_mu_rf = SCENARIOS_RENTABILIDAD[sel_ret]["rf"]
-            st.info(f"Usando: {SCENARIOS_RENTABILIDAD[sel_ret]['label']}")
+            st.info(f"RV: {fmt_pct(chosen_mu_rv)} | RF: {fmt_pct(chosen_mu_rf)}")
         
         st.divider()
         n_sims = st.slider("Simulaciones", 500, 3000, 1000)
         horiz = st.slider("Horizonte (Años)", 10, 50, 40)
 
-    tab_sim, tab_opt = st.tabs(["📊 Simulador", "🎯 Optimizador"])
-
-    total_ini = 1800000000; pct_rv_def = 60 
+    tab_sim, tab_opt = st.tabs(["📊 Simulador Principal", "🎯 Optimizador de Metas"])
 
     with tab_sim:
         st.subheader("1. Capital y Estructura")
         c1, c2, c3 = st.columns(3)
-        with c1: cap_input = clean_input("Capital Total ($)", total_ini, "cap_total")
-        with c2: pct_rv_user = st.slider("Motor (RV %)", 0, 100, pct_rv_def)
+        with c1: cap_input = clean_input("Capital Total ($)", 1800000000, "cap_total")
+        with c2: pct_rv_user = st.slider("Motor (RV %)", 0, 100, 60) # FORZADO A 60
         with c3: st.metric("Mix", f"{100-pct_rv_user}% RF / {pct_rv_user}% RV")
         
         st.subheader("2. Gastos e Hitos")
@@ -203,16 +194,16 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
             if st.button("Limpiar"): st.session_state.extra_events = []
 
         st.subheader("3. Respaldo Inmobiliario")
-        enable_prop = st.checkbox("Activar Venta Emergencia", value=True) 
+        enable_prop = st.checkbox("Activar Venta Emergencia", value=True) # FORZADO A TRUE
         if enable_prop:
-            val_inmo = clean_input("Valor Neto Casa ($)", 500000000, "v_i")
+            val_inmo = clean_input("Valor Neto Casa ($)", 500000000, "v_i") # FORZADO A 500M
             trigger_m = st.slider("Gatillo (Meses Vida)", 6, 60, 24)
         else: val_inmo, trigger_m = 0, 0
 
         if st.button("🚀 INICIAR SIMULACIÓN", type="primary"):
             assets = [AssetBucket("Motor", pct_rv_user/100, False), AssetBucket("Defensa", (100-pct_rv_user)/100, True)]
             wds = [WithdrawalTramo(0, d1, r1), WithdrawalTramo(d1, d1+d2, r2), WithdrawalTramo(d1+d2, horiz, r3)]
-            cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, is_active_managed=is_active, enable_prop=enable_prop, net_inmo_value=val_inmo, emergency_months_trigger=trigger_m, extra_cashflows=st.session_state.extra_events, mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf, mu_local_rv=-0.15, mu_local_rf=0.08, corr_local=-0.25, mu_global_rv=SCENARIOS_GLOBAL[sel_glo]['rv'], mu_global_rf=SCENARIOS_GLOBAL[sel_glo]['rf'], corr_global=SCENARIOS_GLOBAL[sel_glo]['corr'])
+            cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, is_active_managed=is_active, enable_prop=enable_prop, net_inmo_value=val_inmo, emergency_months_trigger=trigger_m, extra_cashflows=st.session_state.extra_events, mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf, mu_local_rv=-0.15, mu_local_rf=0.08, corr_local=-0.25, mu_global_rv=SCENARIOS_GLOBAL[sel_glo]['rv'], mu_global_rf=-0.02, corr_global=SCENARIOS_GLOBAL[sel_glo]['corr'])
             sim = InstitutionalSimulator(cfg, assets, wds); paths, cpi, ruin_indices = sim.run()
             
             success_prob = (1 - (np.sum(ruin_indices > -1)/n_sims))*100
@@ -223,7 +214,7 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
             y_ax = np.arange(paths.shape[1])/12; fig = go.Figure()
             fig.add_trace(go.Scatter(x=np.concatenate([y_ax, y_ax[::-1]]), y=np.concatenate([np.percentile(paths, 90, 0), np.percentile(paths, 10, 0)[::-1]]), fill='toself', fillcolor='rgba(59,130,246,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
             fig.add_trace(go.Scatter(x=y_ax, y=np.percentile(paths, 50, 0), line=dict(color='#3b82f6', width=3), name='Mediana'))
-            fig.update_layout(title="Evolución Patrimonio", template="plotly_dark"); st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(title="Evolución Patrimonio (Nominal)", template="plotly_dark"); st.plotly_chart(fig, use_container_width=True)
 
     with tab_opt:
         st.subheader("🎯 Buscador de Soluciones")
@@ -233,7 +224,6 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
         if st.button("🔍 CALCULAR VALOR ÓPTIMO"):
             results = []
             with st.spinner("Ejecutando iteraciones de mercado..."):
-                # Rango de búsqueda
                 if "Mix" in var_to_opt: vals = np.linspace(0, 100, 11)
                 else: 
                     base = r1 if "1" in var_to_opt else (r2 if "2" in var_to_opt else r3)
@@ -244,17 +234,17 @@ def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000
                         t_assets = [AssetBucket("Motor", v/100, False), AssetBucket("Defensa", (100-v)/100, True)]
                         t_wds = [WithdrawalTramo(0, d1, r1), WithdrawalTramo(d1, d1+d2, r2), WithdrawalTramo(d1+d2, horiz, r3)]
                     else:
-                        t_assets = [AssetBucket("Motor", pct_rv_user/100, False), AssetBucket("Defensa", (100-pct_rv_user)/100, True)]
+                        t_assets = [AssetBucket("Motor", 0.6, False), AssetBucket("Defensa", 0.4, True)]
                         tw1, tw2, tw3 = r1, r2, r3
                         if "1" in var_to_opt: tw1 = v
                         elif "2" in var_to_opt: tw2 = v
                         else: tw3 = v
                         t_wds = [WithdrawalTramo(0, d1, tw1), WithdrawalTramo(d1, d1+d2, tw2), WithdrawalTramo(d1+d2, horiz, tw3)]
 
-                    c_opt = SimulationConfig(horizon_years=horiz, initial_capital=cap_input, n_sims=500, is_active_managed=is_active, enable_prop=enable_prop, net_inmo_value=val_inmo, emergency_months_trigger=trigger_m, extra_cashflows=st.session_state.extra_events, mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf, mu_local_rv=-0.15, mu_local_rf=0.08, corr_local=-0.25, mu_global_rv=SCENARIOS_GLOBAL[sel_glo]['rv'], mu_global_rf=SCENARIOS_GLOBAL[sel_glo]['rf'], corr_global=SCENARIOS_GLOBAL[sel_glo]['corr'])
+                    c_opt = SimulationConfig(horizon_years=horiz, initial_capital=cap_input, n_sims=400, is_active_managed=is_active, enable_prop=enable_prop, net_inmo_value=val_inmo, emergency_months_trigger=24, extra_cashflows=st.session_state.extra_events, mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf, mu_local_rv=-0.15, mu_local_rf=0.08, corr_local=-0.25, mu_global_rv=SCENARIOS_GLOBAL[sel_glo]['rv'], mu_global_rf=-0.02, corr_global=SCENARIOS_GLOBAL[sel_glo]['corr'])
                     s_t = InstitutionalSimulator(c_opt, t_assets, t_wds)
                     _, _, r_i = s_t.run()
-                    results.append({"val": v, "prob": (1-(np.sum(r_i > -1)/500))*100})
+                    results.append({"val": v, "prob": (1-(np.sum(r_i > -1)/400))*100})
             
             df_opt = pd.DataFrame(results)
             best = df_opt.iloc[(df_opt['prob']-target_prob).abs().argsort()[:1]]
