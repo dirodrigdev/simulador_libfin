@@ -108,7 +108,7 @@ def render_home():
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # PASO DE PARAMETROS AL SIMULADOR
+    # PASO DE PARAMETROS AL SIMULADOR (CORREGIDO)
     simulador.app(
         default_rf=d.get('rf',0), 
         default_mx=d.get('mx', 0), 
