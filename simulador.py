@@ -71,8 +71,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             capital_paths = np.zeros((n_sims, n_steps + 1)); capital_paths[:, 0] = self.cfg.initial_capital
             cpi_paths = np.ones((n_sims, n_steps + 1))
             ruin_indices = np.full(n_sims, -1)
-            
-            # --- DEBUG: Arrays para graficar flujos netos ---
             debug_net_flow = np.zeros(n_steps + 1)
             
             asset_values = np.zeros((n_sims, n_assets))
@@ -80,7 +78,16 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
             try: L = np.linalg.cholesky(self.corr_matrix)
             except: L = np.eye(n_assets)
-            p_crisis = 1 - (1 - self.cfg.prob_crisis)**self.dt
+
+            # --- CORRECCIÓN V5.8: Lógica Anti-Doble Castigo ---
+            if self.cfg.use_fat_tails:
+                # Si usamos matemática de Colas Gordas (T-Student), las crisis ya están implícitas.
+                # Desactivamos el "script" de crisis manual para no duplicar el riesgo.
+                p_crisis = 0.0 
+            else:
+                # Si usamos Normal, necesitamos el script para inyectar realidad.
+                p_crisis = 1 - (1 - self.cfg.prob_crisis)**self.dt
+            
             in_crisis = np.zeros(n_sims, dtype=bool)
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
 
@@ -102,10 +109,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
                 cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + inf_shock)
                 
-                # 2. Mercado
-                new_c = np.random.rand(n_sims) < p_crisis
-                in_crisis = np.logical_or(in_crisis, new_c)
-                in_crisis[np.random.rand(n_sims) < 0.15] = False 
+                # 2. Mercado (Crisis Script solo si NO hay Fat Tails)
+                if p_crisis > 0:
+                    new_c = np.random.rand(n_sims) < p_crisis
+                    in_crisis = np.logical_or(in_crisis, new_c)
+                    in_crisis[np.random.rand(n_sims) < 0.15] = False 
 
                 if self.cfg.use_fat_tails:
                     df = 5; std_adj = np.sqrt((df-2)/df)
@@ -117,7 +125,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 step_rets = np.zeros((n_sims, n_assets))
                 for i, asset in enumerate(self.assets):
                     mu, sig = asset.mu_nominal, asset.sigma_nominal
-                    if np.any(in_crisis): mu *= self.cfg.crisis_drift; sig *= self.cfg.crisis_vol
+                    
+                    # Solo aplicamos drift de crisis si el script está activo
+                    if p_crisis > 0 and np.any(in_crisis): 
+                        mu *= self.cfg.crisis_drift; sig *= self.cfg.crisis_vol
+                    
                     if self.cfg.use_mean_reversion and asset.is_bond:
                         step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                     else:
@@ -127,7 +139,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 
                 current_year = t / 12
 
-                # 4. EVENTO VENTA (Solo Portfolio)
+                # 4. EVENTO VENTA (Portfolio Strategy)
                 if self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * 12):
                     if self.cfg.inmo_strategy == 'portfolio':
                         injection = self.cfg.net_inmo_value * cpi_paths[:, t]
@@ -165,25 +177,13 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 if self.cfg.sell_year > 0 and current_year >= self.cfg.sell_year and self.cfg.inmo_strategy == 'annuity':
                     annuity_nom = np.full(n_sims, annuity_monthly_payout_real) * cpi_paths[:, t]
 
-                # D) NETEO (Aquí está la clave)
-                # Ingresos (Positivos) - Gastos (Negativos)
-                # Si Ingresos > Gastos -> NETO POSITIVO (Entra plata al portafolio)
-                # Si Ingresos < Gastos -> NETO NEGATIVO (Sale plata del portafolio)
-                
+                # D) NETEO
                 net_cashflow = annuity_nom - (living_nom + rent_nom)
-                
-                # Para graficar, guardamos la mediana del flujo neto
                 debug_net_flow[t] = np.median(net_cashflow)
 
-                # Si net_cashflow es POSITIVO, ratio es NEGATIVO (Inyección)
-                # Si net_cashflow es NEGATIVO (Déficit), ratio es POSITIVO (Retiro)
-                
-                # Queremos retirar el DÉFICIT.
-                # Deficit = (Gastos - Ingresos) = -NetCashflow
                 withdrawal_needed = -net_cashflow 
-                
                 ratio = np.divide(withdrawal_needed, total_cap, out=np.zeros_like(total_cap), where=total_cap!=0)
-                ratio = np.minimum(ratio, 1.0) # Tope quiebra
+                ratio = np.minimum(ratio, 1.0)
                 
                 asset_values *= (1 - ratio[:, np.newaxis])
                 
@@ -320,7 +320,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 "succ": success, "leg": median_legacy, "paths": paths, 
                 "ruin_start": start_80_pct, "n_fails": len(fails),
                 "annuity_val": annuity_val, "rent_cost": rent_cost,
-                "deb_net": deb_net # Ahora guardamos el flujo NETO
+                "deb_net": deb_net 
             }
 
     if st.session_state.current_results:
@@ -342,7 +342,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             delta_cash = res['annuity_val'] - res['rent_cost']
             c3.metric("Flujo Inmobiliario Neto", f"${fmt(delta_cash)}/mes", delta="Superávit" if delta_cash > 0 else "Déficit")
 
-        # Gráfico Principal
         y = np.arange(res["paths"].shape[1])/12
         p10, p50, p90 = np.percentile(res["paths"], 10, axis=0), np.percentile(res["paths"], 50, axis=0), np.percentile(res["paths"], 90, axis=0)
         
@@ -353,37 +352,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         if sell_prop and sale_year > 0: fig.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta Casa")
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- GRÁFICO VALIDACIÓN FLUJO NETO (CORREGIDO) ---
         with st.expander("🔎 Validar Flujos de Caja (Neto: Ingreso - Gastos)", expanded=True):
             fig_f = go.Figure()
-            
-            # Línea de Flujo Neto
             net_flow = res['deb_net']
-            
-            # Usamos dos trazos para pintar verde/rojo según sea positivo/negativo
-            # (Truco simple: Pintamos una sola línea y rellenos condicionales son complejos en plotly simple,
-            # pero usaremos referencia cero)
-            
-            fig_f.add_trace(go.Scatter(
-                x=y, y=net_flow, 
-                name="Flujo Neto (Mediana)", 
-                line=dict(color='black', width=2),
-                fill='tozeroy' # Rellena hacia el 0
-            ))
-            
-            # Configurar colores de relleno no es trivial en una sola serie, 
-            # pero visualmente si está arriba de 0 es bueno.
-            
-            fig_f.update_layout(
-                title="Flujo de Caja Neto (Ingresos Casa - Gastos Totales)", 
-                yaxis_title="Superávit (+) / Déficit (-) Mensual", 
-                height=300,
-                shapes=[dict(type="line", x0=0, x1=40, y0=0, y1=0, line=dict(color="gray", width=1, dash="dot"))]
-            )
-            
-            # Anotaciones
-            if sell_prop:
-                fig_f.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta")
-                
+            fig_f.add_trace(go.Scatter(x=y, y=net_flow, name="Flujo Neto (Mediana)", line=dict(color='black', width=2), fill='tozeroy'))
+            fig_f.update_layout(title="Flujo de Caja Neto (Ingresos Casa - Gastos Totales)", yaxis_title="Superávit (+) / Déficit (-) Mensual", height=300, shapes=[dict(type="line", x0=0, x1=40, y0=0, y1=0, line=dict(color="gray", width=1, dash="dot"))])
+            if sell_prop: fig_f.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta")
             st.plotly_chart(fig_f, use_container_width=True)
-            st.caption("Si la línea está por ENCIMA de 0, tus ingresos cubren todo y sobran (se reinvierten). Si está por DEBAJO, tienes que sacar dinero del portafolio.")
+            st.caption("Si la línea está por ENCIMA de 0, tus ingresos cubren todo y sobran. Si está por DEBAJO, sacas dinero del portafolio.")
