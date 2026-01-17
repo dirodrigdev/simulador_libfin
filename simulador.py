@@ -95,7 +95,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         annuity_monthly_payout_real = self.cfg.net_inmo_value * (r_monthly * factor) / (factor - 1)
                     else: annuity_monthly_payout_real = self.cfg.net_inmo_value / months
 
-            # FIX: Inicializar variable fuera del loop para evitar UnboundLocalError
+            # INICIALIZACIÓN FUERA DEL LOOP (CORRECCIÓN CRÍTICA)
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
 
             for t in range(1, n_steps + 1):
@@ -145,7 +145,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
                 total_cap = np.sum(asset_values, axis=1)
                 
-                # Definir variable dentro del loop
+                # Actualización de riqueza real DENTRO del loop
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
 
@@ -157,7 +157,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 
                 living_nom = np.zeros(n_sims)
                 if self.cfg.use_guardrails:
-                    # Protección para evitar división por cero
+                    # Protección div/0
                     denom = np.maximum(max_real_wealth, 1.0)
                     dd_port = (max_real_wealth - current_real_wealth) / denom
                     in_trouble_g = dd_port > self.cfg.guardrail_trigger
@@ -272,6 +272,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         use_smart = st.checkbox("🥛 Smart Buckets", value=True, help="Prioriza sacar de RF.")
         use_guard = st.checkbox("🛡️ Guardrails", value=True)
         use_fat = st.checkbox("📉 Fat Tails", value=True)
+        # Eliminado Bonos Reales para evitar inestabilidad
         
         if use_guard:
             c1, c2 = st.columns(2)
@@ -326,7 +327,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, 
             inflation_mean=p_inf/100, prob_crisis=p_cris/100,
             use_guardrails=use_guard, guardrail_trigger=gr_trigger/100.0, guardrail_cut=gr_cut/100.0,
-            use_fat_tails=use_fat, use_mean_reversion=False, # Estabilidad
+            use_fat_tails=use_fat, use_mean_reversion=False, # Desactivado por seguridad
             use_smart_buckets=use_smart,
             sell_year=sale_year, net_inmo_value=net_inmo_val, new_rent_cost=rent_cost,
             inmo_strategy=inmo_strat_code, annuity_rate=annuity_rate_ui/100.0
@@ -371,8 +372,8 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             c3.metric("Flujo Inmobiliario Neto", f"${fmt(delta_cash)}/mes", delta="Superávit" if delta_cash > 0 else "Déficit")
 
         y = np.arange(res["paths"].shape[1])/12
-        # FIX VISUAL: Clip para evitar que valores infinitos rompan el gráfico
-        paths_clean = np.clip(res["paths"], 0, np.percentile(res["paths"][:,-1], 95) * 2.0)
+        # Limpieza de visualización para evitar que valores infinitos rompan el gráfico
+        paths_clean = np.clip(res["paths"], 0, np.percentile(res["paths"][:,-1], 95) * 1.5)
         
         p10 = np.percentile(paths_clean, 10, axis=0)
         p50 = np.percentile(paths_clean, 50, axis=0)
