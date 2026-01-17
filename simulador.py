@@ -99,6 +99,8 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                     else:
                         annuity_monthly_payout_real = self.cfg.net_inmo_value / months
 
+            max_real_wealth = np.full(n_sims, self.cfg.initial_capital) # Inicializar fuera del loop
+
             for t in range(1, n_steps + 1):
                 # 1. Inflación
                 inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
@@ -131,8 +133,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                         # DETECTOR DE CRISIS RV: Si la bolsa cae, activamos "Trouble" para no rebalancear
                         if self.cfg.use_smart_buckets and i == 0: 
-                             # Caída mensual > 2 sigmas o retorno negativo fuerte
-                             crash_limit = -0.02 # Caída mensual del 2% nominal ya enciende alertas de rebalanceo
+                             crash_limit = -0.02 # Caída mensual del 2%
                              sim_in_trouble = np.logical_or(sim_in_trouble, step_rets[:, i] < crash_limit)
 
                 asset_values *= np.exp(step_rets)
@@ -147,15 +148,17 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 
                 total_cap = np.sum(asset_values, axis=1)
 
+                # --- CORRECCIÓN BUG V6.2: Definir current_real_wealth SIEMPRE aquí ---
+                current_real_wealth = total_cap / cpi_paths[:, t]
+                max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
+                # --------------------------------------------------------------------
+
                 # 5. GESTIÓN FLUJO DE CAJA
-                # A) Gastos
+                # A) Gastos Base
                 living_base = 0
                 for w in self.withdrawals:
                     if w.from_year <= current_year < w.to_year:
                         living_base = w.amount_nominal_monthly_start; break
-                
-                current_real_wealth = total_cap / cpi_paths[:, t]
-                max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
                 
                 living_nom = np.zeros(n_sims)
                 if self.cfg.use_guardrails:
@@ -180,7 +183,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 # Si es negativo, necesitamos retirar (Déficit)
                 withdrawal_needed = -net_cashflow 
                 
-                # --- LÓGICA V6.1: TRUE CASH BUFFER ---
+                # --- LÓGICA SMART BUCKETS ---
                 rf_idx = 1; rv_idx = 0
                 
                 # Caso 1: Reinversión (Superávit -> Inyección)
@@ -195,10 +198,10 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                     wd_req = withdrawal_needed[mask_deficit]
                     
                     if self.cfg.use_smart_buckets:
-                        # ESTRATEGIA: SIEMPRE INTENTAR SACAR DE RF PRIMERO (No importa si hay crisis o no)
+                        # ESTRATEGIA: SIEMPRE INTENTAR SACAR DE RF PRIMERO
                         rf_bal = asset_values[mask_deficit, rf_idx]
                         
-                        # Cuánto sacamos de RF? Todo lo posible hasta cubrir la deuda
+                        # Cuánto sacamos de RF?
                         take_rf = np.minimum(wd_req, rf_bal)
                         
                         # Si falta, sacamos de RV (Capitulación)
@@ -207,13 +210,12 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         asset_values[mask_deficit, rf_idx] -= take_rf
                         asset_values[mask_deficit, rv_idx] -= take_rv
                     else:
-                        # Proporcional (Vieja Escuela)
+                        # Proporcional
                         tot_d = total_cap[mask_deficit]
                         ratio_d = np.divide(wd_req, tot_d, out=np.zeros_like(tot_d), where=tot_d!=0)
                         asset_values[mask_deficit] *= (1 - ratio_d[:, np.newaxis])
 
-                # 6. REBALANCEO (RELLENADO DE BUCKET)
-                # Solo rebalanceamos ANUALMENTE y SI NO HAY CRISIS
+                # 6. REBALANCEO
                 is_sale_event = (self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * 12))
                 
                 if (t % 12 == 0) or is_sale_event:
@@ -228,16 +230,8 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                             
                             # Volver a los pesos objetivo (Rellenar RF con ganancias de RV)
                             if np.any(alive_ok):
-                                # Simplificación vectorizada: Rebalanceamos todo el subgrupo OK
-                                # (Los que están en crisis NO se tocan, dejando que el RF baje y RV recupere)
-                                # Esta lógica requiere reconstruir el array completo, lo cual es lento en python puro.
-                                # Haremos un rebalanceo selectivo "in-place":
-                                
-                                # Calcular target amounts
                                 tgt_rf = tot_ok * self.assets[rf_idx].weight
                                 tgt_rv = tot_ok * self.assets[rv_idx].weight
-                                
-                                # Asignar
                                 asset_values[rebalance_mask, rf_idx] = tgt_rf
                                 asset_values[rebalance_mask, rv_idx] = tgt_rv
                                 
@@ -301,7 +295,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         st.divider()
         st.markdown("### 🧠 Seguridad")
         # V6.1: SMART BUCKETS
-        use_smart = st.checkbox("🥛 Estrategia Buckets (Cash Buffer)", value=True, help="Usa RF para gastos diarios. Rellena el bucket con RV solo en años buenos.")
+        use_smart = st.checkbox("🥛 Estrategia Buckets (Cash Buffer)", value=True, help="En crisis, saca dinero SOLO de Renta Fija para no vender acciones barato.")
         use_guard = st.checkbox("🛡️ Guardrails", value=True)
         use_fat = st.checkbox("📉 Fat Tails", value=True)
         use_bond = st.checkbox("🔄 Bonos Reales", value=True)
