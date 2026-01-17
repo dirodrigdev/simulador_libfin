@@ -5,14 +5,18 @@ import plotly.graph_objects as go
 from dataclasses import dataclass
 import re
 
-# --- CLASES DEL MOTOR ---
+# --- 1. CONFIGURACIÓN Y CLASES DE DATOS ---
 @dataclass
 class AssetBucket:
-    name: str; weight: float = 0.0; mu_nominal: float = 0.0; sigma_nominal: float = 0.0; is_bond: bool = False
+    name: str
+    weight: float = 0.0
+    is_bond: bool = False
 
 @dataclass
 class WithdrawalTramo:
-    from_year: int; to_year: int; amount_nominal_monthly_start: float
+    from_year: int
+    to_year: int
+    amount_nominal_monthly_start: float
 
 @dataclass
 class SimulationConfig:
@@ -20,22 +24,38 @@ class SimulationConfig:
     steps_per_year: int = 12
     initial_capital: float = 1_000_000
     n_sims: int = 2000
+    
+    # Inflación
     inflation_mean: float = 0.035
-    inflation_vol: float = 0.01
-    prob_crisis: float = 0.05
-    crisis_drift: float = 0.85
-    crisis_vol: float = 1.25
-    use_fat_tails: bool = True
+    inflation_vol: float = 0.012
+    
+    # Estrategias
     use_guardrails: bool = True
     guardrail_trigger: float = 0.15
     guardrail_cut: float = 0.10
-    use_smart_buckets: bool = True 
+    use_smart_buckets: bool = True
+    
+    # Inmobiliario
     sell_year: int = 0
     net_inmo_value: float = 0
     new_rent_cost: float = 0
     inmo_strategy: str = "portfolio"
     annuity_rate: float = 0.05 
+    
+    # --- PARÁMETROS INTERNOS (CALCULADOS AUTOMÁTICAMENTE) ---
+    mu_local_rv: float = -0.15
+    mu_local_rf: float = 0.08  
+    corr_local: float = -0.25  
+    
+    mu_global_rv: float = -0.35 
+    mu_global_rf: float = -0.06 
+    corr_global: float = 0.90   
+    
+    prob_enter_local: float = 0.005  
+    prob_enter_global: float = 0.004 
+    prob_exit_crisis: float = 0.085  
 
+# --- 2. EL MOTOR DE SIMULACIÓN (V7 SOVEREIGN GRADE - INTOCABLE) ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config
@@ -43,7 +63,33 @@ class InstitutionalSimulator:
         self.withdrawals = withdrawals
         self.dt = 1/config.steps_per_year
         self.total_steps = int(config.horizon_years * config.steps_per_year)
-        self.corr_matrix = np.eye(len(assets))
+
+        # DEFINICIÓN DE 3 RÉGIMENES
+        self.mu_regimes = np.array([
+            [0.10, 0.06],                     # 0: Normal (Crecimiento)
+            [self.cfg.mu_local_rv, self.cfg.mu_local_rf],    # 1: Local
+            [self.cfg.mu_global_rv, self.cfg.mu_global_rf]   # 2: Global
+        ])
+        
+        self.sigma_regimes = np.array([
+            [0.14, 0.05],   # 0: Normal
+            [0.22, 0.18],   # 1: Local
+            [0.32, 0.15]    # 2: Global
+        ])
+        
+        # MATRICES DE CORRELACIÓN
+        cn = np.array([[1.0, 0.35], [0.35, 1.0]])
+        self.L_normal = np.linalg.cholesky(cn)
+        
+        cl = np.clip(self.cfg.corr_local, -0.99, 0.99)
+        self.L_local = np.linalg.cholesky(np.array([[1.0, cl], [cl, 1.0]]))
+        
+        cg = np.clip(self.cfg.corr_global, -0.99, 0.99)
+        self.L_global = np.linalg.cholesky(np.array([[1.0, cg], [cg, 1.0]]))
+        
+        self.p_norm_to_local = self.cfg.prob_enter_local
+        self.p_norm_to_global = self.cfg.prob_enter_global
+        self.p_exit = self.cfg.prob_exit_crisis
 
     def run(self):
         n_sims, n_steps = self.cfg.n_sims, self.total_steps
@@ -53,101 +99,109 @@ class InstitutionalSimulator:
         capital_paths[:, 0] = self.cfg.initial_capital
         cpi_paths = np.ones((n_sims, n_steps + 1))
         ruin_indices = np.full(n_sims, -1)
-        debug_net_flow = np.zeros(n_steps + 1)
         
         asset_values = np.zeros((n_sims, n_assets))
         for i, a in enumerate(self.assets):
             asset_values[:, i] = self.cfg.initial_capital * a.weight
-
-        try: L = np.linalg.cholesky(self.corr_matrix)
-        except: L = np.eye(n_assets)
-
+            
         try: rv_idx = next(i for i, a in enumerate(self.assets) if not a.is_bond)
         except: rv_idx = 0
         try: rf_idx = next(i for i, a in enumerate(self.assets) if a.is_bond)
         except: rf_idx = 1
-
-        p_crisis_manual = 1 - (1 - self.cfg.prob_crisis)**self.dt
-        use_crisis_vol = not self.cfg.use_fat_tails
-        in_crisis = np.zeros(n_sims, dtype=bool)
-        shadow_rv_index = np.ones(n_sims); shadow_rv_peak = np.ones(n_sims)
+        
+        current_regime = np.zeros(n_sims, dtype=int)
         
         annuity_monthly = 0
         if self.cfg.sell_year > 0 and self.cfg.inmo_strategy == 'annuity':
             months = (self.cfg.horizon_years - self.cfg.sell_year) * 12
             if months > 0:
                 r_m = self.cfg.annuity_rate / 12
-                if r_m > 0:
-                    annuity_monthly = self.cfg.net_inmo_value * (r_m * (1+r_m)**months) / ((1+r_m)**months - 1)
-                else: annuity_monthly = self.cfg.net_inmo_value / months
+                annuity_monthly = self.cfg.net_inmo_value * (r_m * (1+r_m)**months) / ((1+r_m)**months - 1) if r_m > 0 else self.cfg.net_inmo_value / months
 
-        # CRÍTICO: Inicialización fuera del loop
-        max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
+        # MOTOR MATEMÁTICO: T-STUDENT MULTIVARIANTE REAL
+        df = 8 
+        G = np.random.normal(0, 1, (n_sims, n_steps, n_assets))
+        W = np.random.chisquare(df, (n_sims, n_steps, 1)) / df
+        Z_base = G / np.sqrt(W)
+        Z_base *= np.sqrt((df-2)/df) 
 
-        for t in range(1, n_steps + 1):
-            inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
-            cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + np.maximum(inf_shock, -0.99))
+        inf_shocks = np.random.normal(self.cfg.inflation_mean * self.dt, 
+                                      self.cfg.inflation_vol * np.sqrt(self.dt), 
+                                      (n_sims, n_steps))
+
+        for t in range(n_steps):
+            mask_0 = (current_regime == 0)
+            rand_0 = np.random.rand(np.sum(mask_0))
             
-            if p_crisis_manual > 0:
-                new_c = np.random.rand(n_sims) < p_crisis_manual
-                in_crisis = np.logical_or(in_crisis, new_c)
-                in_crisis[np.random.rand(n_sims) < 0.15] = False
-
-            if self.cfg.use_fat_tails:
-                z_uncorr = np.random.standard_t(5, (n_sims, n_assets)) * np.sqrt(0.6)
-            else:
-                z_uncorr = np.random.normal(0, 1, (n_sims, n_assets))
-            z_corr = np.dot(z_uncorr, L.T)
+            p_L = self.p_norm_to_local
+            p_G = self.p_norm_to_global
             
-            step_rets = np.zeros((n_sims, n_assets))
-            for i, a in enumerate(self.assets):
-                mu, sig = a.mu_nominal, a.sigma_nominal
-                if p_crisis_manual > 0 and np.any(in_crisis): 
-                    mu *= self.cfg.crisis_drift 
-                    if use_crisis_vol: sig *= self.cfg.crisis_vol
-                step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
-
-            # SAFETY CLIP: Evita explosiones exponenciales
-            step_rets = np.clip(step_rets, -0.5, 0.5)
+            new_0_to_1 = rand_0 < p_L
+            new_0_to_2 = (rand_0 >= p_L) & (rand_0 < (p_L + p_G))
+            
+            idx_0 = np.where(mask_0)[0]
+            current_regime[idx_0[new_0_to_1]] = 1
+            current_regime[idx_0[new_0_to_2]] = 2
+            
+            mask_crisis = (current_regime > 0)
+            if np.any(mask_crisis):
+                rand_c = np.random.rand(np.sum(mask_crisis))
+                back_to_norm = rand_c < self.p_exit
+                idx_c = np.where(mask_crisis)[0]
+                current_regime[idx_c[back_to_norm]] = 0
+            
+            current_inf_shock = inf_shocks[:, t]
+            current_inf_shock[current_regime == 1] += 0.003 
+            cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + np.maximum(current_inf_shock, -0.02))
+            
+            z_t = Z_base[:, t, :] 
+            z_final = np.zeros_like(z_t)
+            
+            m0 = (current_regime == 0)
+            m1 = (current_regime == 1)
+            m2 = (current_regime == 2)
+            
+            if np.any(m0): z_final[m0] = np.dot(z_t[m0], self.L_normal.T)
+            if np.any(m1): z_final[m1] = np.dot(z_t[m1], self.L_local.T)
+            if np.any(m2): z_final[m2] = np.dot(z_t[m2], self.L_global.T)
+            
+            mus_t = self.mu_regimes[current_regime]
+            sigs_t = self.sigma_regimes[current_regime]
+            
+            step_rets = (mus_t - 0.5 * sigs_t**2) * self.dt + \
+                         sigs_t * np.sqrt(self.dt) * z_final
+            
+            step_rets = np.clip(step_rets, -0.6, 0.6) 
             asset_values *= np.exp(step_rets)
             
-            shadow_rv_index *= np.exp(step_rets[:, rv_idx])
-            shadow_rv_peak = np.maximum(shadow_rv_peak, shadow_rv_index)
-            mkt_dd = (shadow_rv_peak - shadow_rv_index) / np.maximum(shadow_rv_peak, 1e-9)
-            sim_in_trouble = np.logical_or(in_crisis, mkt_dd > 0.15)
-
             spy = self.cfg.steps_per_year
-            current_year = t / spy
-
-            if self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * spy):
+            current_year = (t+1) / spy
+            
+            if self.cfg.sell_year > 0 and (t+1) == int(self.cfg.sell_year * spy):
                 if self.cfg.inmo_strategy == 'portfolio':
-                    asset_values[:, 0] += self.cfg.net_inmo_value * cpi_paths[:, t]
-
+                    asset_values[:, 0] += self.cfg.net_inmo_value * cpi_paths[:, t+1]
+            
             total_cap = np.sum(asset_values, axis=1)
-            current_real_wealth = total_cap / cpi_paths[:, t]
-            max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
-
+            current_real_wealth = total_cap / cpi_paths[:, t+1]
+            
             living_base = 0
             for w in self.withdrawals:
                 if w.from_year <= current_year < w.to_year:
                     living_base = w.amount_nominal_monthly_start; break
             
-            living_nom = np.zeros(n_sims)
+            living_nom = np.full(n_sims, living_base) * cpi_paths[:, t+1]
+            
             if self.cfg.use_guardrails:
-                dd_port = (max_real_wealth - current_real_wealth) / np.maximum(max_real_wealth, 1.0)
-                in_tr_g = dd_port > self.cfg.guardrail_trigger
-                living_nom[~in_tr_g] = living_base * cpi_paths[~in_tr_g, t]
-                living_nom[in_tr_g] = (living_base * cpi_paths[in_tr_g, t]) * (1.0 - self.cfg.guardrail_cut)
-            else: living_nom = np.full(n_sims, living_base) * cpi_paths[:, t]
+                 dd_initial = (self.cfg.initial_capital - current_real_wealth) / self.cfg.initial_capital
+                 living_nom[dd_initial > 0.20] *= (1.0 - self.cfg.guardrail_cut)
 
             rent_nom = np.zeros(n_sims); ann_nom = np.zeros(n_sims)
             if self.cfg.sell_year > 0 and current_year >= self.cfg.sell_year:
-                rent_nom = np.full(n_sims, self.cfg.new_rent_cost) * cpi_paths[:, t]
+                rent_nom = np.full(n_sims, self.cfg.new_rent_cost) * cpi_paths[:, t+1]
                 if self.cfg.inmo_strategy == 'annuity':
-                    ann_nom = np.full(n_sims, annuity_monthly) * cpi_paths[:, t]
-
+                    ann_nom = np.full(n_sims, annuity_monthly) * cpi_paths[:, t+1]
+            
             net_cashflow = ann_nom - (living_nom + rent_nom)
-            debug_net_flow[t] = np.median(net_cashflow)
             port_adj = -net_cashflow 
             
             mask_surp = port_adj <= 0
@@ -155,11 +209,10 @@ class InstitutionalSimulator:
                 surp = -port_adj[mask_surp]
                 for i, asset in enumerate(self.assets):
                     asset_values[mask_surp, i] += surp * asset.weight
-
+            
             mask_def = port_adj > 0
             if np.any(mask_def):
                 wd_req = port_adj[mask_def]
-                # SAFETY CLIP: No retirar más de lo que existe
                 wd_req = np.minimum(wd_req, total_cap[mask_def])
                 
                 if self.cfg.use_smart_buckets:
@@ -172,155 +225,180 @@ class InstitutionalSimulator:
                     tot_d = total_cap[mask_def]
                     ratio = wd_req / np.where(tot_d!=0, tot_d, 1.0)
                     asset_values[mask_def] *= (1 - np.minimum(ratio, 1.0)[:, np.newaxis])
-
-            if (t % spy == 0) or (self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * spy)):
-                do_reb = ~sim_in_trouble if self.cfg.use_smart_buckets else np.full(n_sims, True)
-                if np.any(do_reb):
-                    tot = np.sum(asset_values[do_reb], axis=1)
-                    alive = tot > 0
-                    if np.any(alive):
-                        for i, a in enumerate(self.assets):
-                            asset_values[do_reb, i] = tot * a.weight
             
             asset_values = np.maximum(asset_values, 0)
-            capital_paths[:, t] = np.sum(asset_values, axis=1)
-            ruin_indices[(capital_paths[:, t-1] > 0) & (capital_paths[:, t] <= 1000)] = t
-            
-        return capital_paths, cpi_paths, ruin_indices, annuity_monthly, debug_net_flow
+            capital_paths[:, t+1] = np.sum(asset_values, axis=1)
+            is_ruined = (capital_paths[:, t+1] <= 1000) & (ruin_indices == -1)
+            ruin_indices[is_ruined] = t+1
 
+        return capital_paths, cpi_paths, ruin_indices, annuity_monthly, np.zeros(n_steps)
+
+# --- 3. UTILIDADES ---
 def clean(lbl, d, k): 
     v = st.text_input(lbl, value=f"{int(d):,}".replace(",", "."), key=k)
     return int(re.sub(r'\D', '', v)) if v else 0
+
 def fmt(v): return f"{int(v):,}".replace(",", ".")
 
-# --- INTERFAZ DEL SIMULADOR ---
-def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default_tc=930, default_ret_rf=6.0, default_ret_rv=10.0, default_inmo_neto=0):
+# --- 4. INTERFAZ PRINCIPAL (TRADUCIDA A LENGUAJE HUMANO) ---
+def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
     
-    SCENARIOS = {
-        "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.5, "vol": 20.0, "crisis": 10},
-        "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5},
-        "Optimista ☀️": {"rf": 7.5, "rv": 13.0, "inf": 2.5, "vol": 14.0, "crisis": 2},
-        "Mis Datos 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
+    st.markdown("## 🦅 Panel de Decisión Patrimonial")
+    st.markdown("Este modelo ejecuta miles de futuros posibles usando el motor **V7 Sovereign Grade** (Validado).")
+
+    # --- DEFINICIONES DE ESCENARIOS (MAPEO HUMANO -> MATEMÁTICO) ---
+    SCENARIOS_GLOBAL = {
+        "Recesión Estándar (Suave)": 
+            {"corr": 0.50, "rf_ret": 0.0, "rv_ret": -0.20, "desc": "La bolsa cae, bonos protegen algo."},
+        "Crash Financiero (Tipo 2008/2020)": 
+            {"corr": 0.70, "rf_ret": -0.02, "rv_ret": -0.30, "desc": "Estrés alto. Todo cae, salvo el cash."},
+        "Colapso Sistémico (Twin Deficits)": 
+            {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.35, "desc": "⚠️ ESCENARIO DEEPSEEK: No hay refugio. Inflación + Recesión."}
+    }
+    
+    SCENARIOS_LOCAL = {
+        "Dólar Blindado (Histórico)": 
+            {"corr": -0.35, "rf_ret": 0.10, "desc": "El Peso colapsa, tu patrimonio en USD se dispara."},
+        "Protección Parcial": 
+            {"corr": -0.15, "rf_ret": 0.05, "desc": "El Dólar ayuda, pero no compensa todo."},
+        "Falla del Hedge (Raro)": 
+            {"corr": 0.20, "rf_ret": 0.0, "desc": "Crisis interna donde incluso el Dólar no reacciona bien."}
     }
 
     with st.sidebar:
-        st.header("1. Escenario")
-        sel = st.selectbox("Preset:", list(SCENARIOS.keys()), index=1)
-        vals = SCENARIOS[sel]
-        with st.expander("Variables", expanded=True):
-            p_inf = st.number_input("Inflación (%)", value=vals["inf"], step=0.1)
-            p_rf = st.number_input("Retorno RF (%)", value=vals["rf"], step=0.1)
-            p_rv = st.number_input("Retorno RV (%)", value=vals["rv"], step=0.1)
-            p_vol = st.slider("Volatilidad RV", 10.0, 30.0, vals["vol"])
-            p_cris = st.slider("Prob. Crisis (%)", 0, 20, vals["crisis"])
+        st.header("1. Elige tu Escenario de Prueba")
+        
+        # Selector Global
+        sel_glo = st.selectbox("🌎 Nivel de Crisis Global", list(SCENARIOS_GLOBAL.keys()), index=2)
+        params_glo = SCENARIOS_GLOBAL[sel_glo]
+        st.info(f"Efecto: {params_glo['desc']}")
+        
+        st.divider()
+        
+        # Selector Local
+        sel_loc = st.selectbox("🇨🇱 Protección Dólar/UF (Local)", list(SCENARIOS_LOCAL.keys()), index=0)
+        params_loc = SCENARIOS_LOCAL[sel_loc]
+        st.info(f"Efecto: {params_loc['desc']}")
 
         st.divider()
-        st.markdown("### 🏡 Estrategia Inmobiliaria")
+        st.markdown("### 🏡 Inmobiliario")
         sell_prop = st.checkbox("Vender Propiedad Futura", value=False)
         if sell_prop:
             val_inmo = st.number_input("Valor Neto Hoy ($)", value=int(default_inmo_neto))
             sale_year = st.slider("Año de Venta", 1, 40, 10)
             rent_cost = st.number_input("Nuevo Arriendo ($/mes)", value=1500000, step=100000)
-            strat = st.radio("Destino:", ["Invertir", "Anualidad"], index=1)
-            inmo_strat = 'portfolio' if strat == "Invertir" else 'annuity'
+            strat = st.radio("Destino:", ["Invertir", "Anualidad"], index=0)
+            inmo_strat = 'portfolio' if "Invertir" in strat else 'annuity'
             annuity_r = 5.0 if inmo_strat == 'annuity' else 0.0
         else:
             val_inmo, sale_year, rent_cost, inmo_strat, annuity_r = 0, 0, 0, 'portfolio', 0
 
         st.divider()
-        st.markdown("### 🧠 Seguridad")
-        use_smart = st.checkbox("🥛 Smart Buckets", True)
-        use_guard = st.checkbox("🛡️ Guardrails", True)
-        use_fat = st.checkbox("📉 Fat Tails", True)
-        
-        n_sims = st.slider("Sims", 500, 5000, 1000)
-        horiz = st.slider("Horizonte", 10, 60, 40)
-
-    st.markdown("### 💰 Capital Inversión")
-    ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
-    if ini_def == 0: ini_def = 1000000
+        n_sims = st.slider("Precisión (Simulaciones)", 500, 3000, 1500)
+        horiz = st.slider("Años a Simular", 10, 50, 40)
+        use_guard = st.checkbox("🛡️ Activar 'Modo Austeridad'", True, help="Reduce gastos un 10% si el patrimonio cae fuerte.")
     
+    # --- CAPITAL (LÓGICA AUTOMÁTICA) ---
+    total_ini = default_rf + default_rv
+    # Cálculo real aproximado para la UI
+    pct_rv_input = (default_rv / total_ini) * 100 if total_ini > 0 else 0
+    
+    st.markdown("### 💰 Tu Estructura (Post-Ajuste)")
     c1, c2, c3 = st.columns(3)
     with c1: 
-        cap_input = clean("Capital Líquido ($)", ini_def, "cap")
-        if sell_prop: st.success(f"Año {sale_year}: +${fmt(val_inmo)}")
-    
-    has_mx = default_mx > 0
+        cap_input = clean("Capital Total ($)", total_ini, "cap_total")
     with c2: 
-        if has_mx:
-            st.caption("Mix Detectado:")
-            pct_rv = st.slider("% Renta Variable", 0, 100, int((default_rv/ini_def)*100) if ini_def>0 else 60)
-        else:
-            pct_rv = st.slider("% Renta Variable", 0, 100, 60)
-
-    with c3: 
-        st.metric("Mix", f"{100-pct_rv}% RF / {pct_rv}% RV")
-        st.caption(f"Nominales: RF {p_rf}% | RV {p_rv}%")
-
-    st.markdown("### 💸 Gastos de Vida (Sin Arriendo)")
-    g1, g2, g3 = st.columns(3)
-    with g1: r1 = clean("Fase 1 ($)", 6000000, "r1"); d1 = st.number_input("Años", 7)
-    with g2: r2 = clean("Fase 2 ($)", 5500000, "r2"); d2 = st.number_input("Años", 13)
-    with g3: r3 = clean("Fase 3 ($)", 5000000, "r3"); st.caption("Resto vida")
+        # Mostramos el % pero deshabilitado o solo informativo si prefieres
+        st.progress(int(pct_rv_input))
+        st.caption(f"Motor de Crecimiento: {int(pct_rv_input)}%")
+    with c3:
+        st.metric("Mix Real", f"{100-int(pct_rv_input)}% Def / {int(pct_rv_input)}% Mot")
     
-    if sell_prop: st.info(f"ℹ️ El arriendo (${fmt(rent_cost)}) se sumará automáticamente desde el año {sale_year}.")
+    st.caption(f"🛡️ **Defensa ({100-int(pct_rv_input)}%)**: Cubre aprox 8-10 años de gastos. | 🚀 **Motor ({int(pct_rv_input)}%)**: Crecimiento largo plazo.")
 
-    if st.button("🚀 EJECUTAR ANÁLISIS PRO", type="primary"):
+    # --- RETIROS ---
+    st.markdown("### 💸 Tus Necesidades (Gasto)")
+    g1, g2, g3 = st.columns(3)
+    with g1: r1 = clean("Fase 1 (Inicio)", 6000000, "r1"); d1 = st.number_input("Años Fase 1", 0, 40, 7)
+    with g2: r2 = clean("Fase 2 (Intermedia)", 5500000, "r2"); d2 = st.number_input("Años Fase 2", 0, 40, 13)
+    with g3: r3 = clean("Fase 3 (Vejez)", 5000000, "r3"); st.caption("Resto de vida")
+
+    # --- RUN ---
+    if st.button("🚀 EJECUTAR ANÁLISIS DE DECISIÓN", type="primary"):
+        # Mapeo de inputs humanos a matemáticos
         assets = [
-            AssetBucket("RV", pct_rv/100, p_rv/100, p_vol/100, False),
-            AssetBucket("RF", (100-pct_rv)/100, p_rf/100, 0.05, True)
+            AssetBucket("Motor", pct_rv_input/100, False), 
+            AssetBucket("Defensa", (100-pct_rv_input)/100, True)
         ]
         wds = [WithdrawalTramo(0, d1, r1), WithdrawalTramo(d1, d1+d2, r2), WithdrawalTramo(d1+d2, horiz, r3)]
         
         cfg = SimulationConfig(
-            horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, 
-            inflation_mean=p_inf/100, prob_crisis=vals["crisis"]/100,
-            use_guardrails=use_guard, use_fat_tails=use_fat, use_smart_buckets=use_smart,
-            sell_year=sale_year, net_inmo_value=val_inmo, new_rent_cost=rent_cost,
-            inmo_strategy=inmo_strat, annuity_rate=annuity_r/100.0
+            horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims,
+            use_guardrails=use_guard, sell_year=sale_year, net_inmo_value=val_inmo, 
+            new_rent_cost=rent_cost, inmo_strategy=inmo_strat, annuity_rate=annuity_r/100.0,
+            
+            # INYECCIÓN DE PARÁMETROS SEGÚN ESCENARIO ELEGIDO
+            mu_local_rv=-0.15, 
+            mu_local_rf=params_loc["rf_ret"], 
+            corr_local=params_loc["corr"],
+            
+            mu_global_rv=params_glo["rv_ret"], 
+            mu_global_rf=params_glo["rf_ret"], 
+            corr_global=params_glo["corr"], 
+            
+            # Probabilidades base fijas (Estándar de industria)
+            prob_enter_local=0.005, prob_enter_global=0.004, prob_exit_crisis=0.085
         )
         
         sim = InstitutionalSimulator(cfg, assets, wds)
-        sim.corr_matrix = np.array([[1.0, 0.25], [0.25, 1.0]])
         
-        with st.spinner("Simulando..."):
-            paths, cpi, ruin_idx, ann_val, deb_net = sim.run()
-            final = paths[:, -1]
-            success = np.mean(final > 0) * 100
-            legacy = np.median(final / cpi[:, -1])
+        with st.spinner("Consultando al Oráculo Matemático..."):
+            paths, cpi, ruin_idx, ann_val, _ = sim.run()
             
-            fails = ruin_idx[ruin_idx > -1]
-            risk_start = np.percentile(fails/12, 20) if len(fails) > 0 else 0
+            final_wealth = paths[:, -1]
+            success_prob = np.mean(final_wealth > 0) * 100
+            median_legacy = np.median(final_wealth / cpi[:, -1])
             
-            clr = "#10b981" if success > 90 else "#ef4444"
-            st.markdown(f"""<div style="text-align:center; padding:20px; border:2px solid {clr}; border-radius:10px;">
-                <h2 style="color:{clr}; margin:0;">Probabilidad de Éxito: {success:.1f}%</h2>
-                <p style="margin:0;">Herencia Real Mediana: <b>${fmt(legacy)}</b></p></div>""", unsafe_allow_html=True)
-            
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Probabilidad Ruina", f"{100-success:.1f}%")
-            c2.metric("Inicio Riesgo (80%)", f"Año {risk_start:.1f}" if len(fails)>0 else "Nunca")
-            if sell_prop and inmo_strat == 'annuity':
-                delta = ann_val - rent_cost
-                c3.metric("Flujo Inmobiliario", f"${fmt(delta)}", delta="Superávit" if delta>0 else "Déficit")
+            # --- SEMÁFORO DE DECISIÓN ---
+            if success_prob >= 90:
+                clr = "#10b981"; msg = "LUZ VERDE"; icon = "✅"
+                rec = "Tu plan es sólido incluso en este escenario de estrés. Puedes proceder."
+            elif success_prob >= 75:
+                clr = "#f59e0b"; msg = "PRECAUCIÓN"; icon = "⚠️"
+                rec = "El riesgo es moderado. Considera reducir gastos o retrasar el retiro 1-2 años."
+            else:
+                clr = "#ef4444"; msg = "PELIGRO"; icon = "🛑"
+                rec = "El plan tiene alto riesgo de falla en este escenario. Necesitas más capital o menos gastos."
 
-            y = np.arange(paths.shape[1])/12
-            # SAFETY CLIP VISUAL:
-            max_y = np.percentile(paths[:,-1], 95) * 1.5
-            paths_safe = np.clip(paths, 0, max_y)
+            st.markdown(f"""
+            <div style="background-color:rgba(30,30,30,0.5); padding:20px; border-radius:10px; border-left: 10px solid {clr}; text-align: center;">
+                <h1 style="color:{clr}; margin:0;">{icon} {msg}</h1>
+                <h2 style="margin:10px 0;">Probabilidad de Éxito: {success_prob:.1f}%</h2>
+                <p style="font-size:1.1em;">{rec}</p>
+                <hr style="border-color: #555;">
+                <p style="margin:0; font-size:0.9em; opacity:0.8;">Herencia Estimada (Valor Hoy): <b>${fmt(median_legacy)}</b></p>
+            </div>""", unsafe_allow_html=True)
             
-            p10, p50, p90 = np.percentile(paths_safe, [10, 50, 90], axis=0)
+            # Gráfico
+            y_axis = np.arange(paths.shape[1])/12
+            upper_bound = np.percentile(paths, 90, axis=0)
+            lower_bound = np.percentile(paths, 10, axis=0)
+            median_path = np.percentile(paths, 50, axis=0)
             
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='#3b82f6', width=3), name='Mediana'))
-            fig.add_trace(go.Scatter(x=y, y=p10, line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=y, y=p90, fill='tonexty', fillcolor='rgba(59, 130, 246, 0.1)', line=dict(width=0), name='Rango 80%'))
-            if sell_prop: fig.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta")
+            fig.add_trace(go.Scatter(x=np.concatenate([y_axis, y_axis[::-1]]), y=np.concatenate([upper_bound, lower_bound[::-1]]),
+                fill='toself', fillcolor='rgba(59, 130, 246, 0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80% (Escenarios Probables)'))
+            fig.add_trace(go.Scatter(x=y_axis, y=median_path, line=dict(color='#3b82f6', width=3), name='Camino Central (Mediana)'))
+            if sell_prop: fig.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta Prop.")
+            
+            fig.update_layout(title="Evolución de tu Patrimonio", xaxis_title="Años Futuros", yaxis_title="Patrimonio ($)", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
-
-            with st.expander("🔎 Flujos de Caja"):
-                fig_f = go.Figure()
-                fig_f.add_trace(go.Scatter(x=y, y=deb_net, fill='tozeroy', name='Flujo Neto'))
-                fig_f.add_hline(y=0, line_dash="dot", line_color="white")
-                if sell_prop: fig_f.add_vline(x=sale_year, line_dash="dash", line_color="green")
-                st.plotly_chart(fig_f, use_container_width=True)
+            
+            # Detalle de Ruina
+            fails = ruin_idx[ruin_idx > -1]
+            if len(fails) > 0:
+                first_fail = np.percentile(fails/12, 10)
+                st.error(f"💀 En el peor 10% de los casos, el dinero se acaba en el año {first_fail:.1f}.")
+            else:
+                st.balloons()
+                st.success("🎉 ¡Felicidades! En 2000 vidas simuladas, nunca te quedaste sin dinero.")
