@@ -9,8 +9,10 @@ import re
 # --- FUNCIÓN PRINCIPAL ---
 def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default_tc=930, default_ret_rf=6.0, default_ret_rv=10.0, default_inmo_neto=0):
     
+    # 1. ESTADO
     if 'current_results' not in st.session_state: st.session_state.current_results = None
     
+    # ESCENARIOS
     SCENARIOS = {
         "Pesimista 🌧️": {"rf": 5.0, "rv": 8.0, "inf": 4.5, "vol": 20.0, "crisis": 10},
         "Estable (Base) ☁️": {"rf": 6.5, "rv": 10.5, "inf": 3.0, "vol": 16.0, "crisis": 5},
@@ -34,6 +36,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             st.session_state.in_vol = vals["vol"]
             st.session_state.in_cris = vals["crisis"]
 
+    # 2. MOTOR MATEMÁTICO
     @dataclass
     class AssetBucket:
         name: str; weight: float = 0.0; mu_nominal: float = 0.0; sigma_nominal: float = 0.0; is_bond: bool = False
@@ -46,7 +49,8 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     class SimulationConfig:
         horizon_years: int = 40; steps_per_year: int = 12; initial_capital: float = 1_000_000; n_sims: int = 2000
         inflation_mean: float = 0.035; inflation_vol: float = 0.01; prob_crisis: float = 0.05
-        crisis_drift: float = 0.85; crisis_vol: float = 1.25 # Drift ajustado de 0.75 a 0.85 para no ser tan castigador
+        crisis_drift: float = 0.85; crisis_vol: float = 1.25
+        # MOTORES
         use_fat_tails: bool = True; use_mean_reversion: bool = True; use_guardrails: bool = True
         guardrail_trigger: float = 0.15; guardrail_cut: float = 0.10
         use_smart_buckets: bool = True 
@@ -79,11 +83,13 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             
             in_crisis = np.zeros(n_sims, dtype=bool)
             
-            # TRACKING PARA SMART BUCKETS (RV PEAK)
-            # Necesitamos saber si la RV está en "Drawdown" (bajo agua) para no venderla.
+            # --- SHADOW BENCHMARK (AUDITORÍA NASA) ---
+            # Creamos un índice fantasma que simula el mercado SIN retiros.
+            # Usaremos esto para decidir si hay crisis, desacoplando el gasto del usuario.
             rv_idx = 0 
-            rf_idx = 1
-            rv_peak_values = asset_values[:, rv_idx].copy() # Máximo histórico de la posición RV
+            shadow_rv_index = np.ones(n_sims) # Empieza en 1.0
+            shadow_rv_peak = np.ones(n_sims)  # Peak histórico del índice
+            # -----------------------------------------
 
             # ANUALIDAD
             annuity_monthly_payout_real = 0
@@ -104,7 +110,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
                 cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + inf_shock)
                 
-                # 2. Crisis Script (Solo si Fat Tails OFF)
+                # 2. Crisis Script
                 if p_crisis > 0:
                     new_c = np.random.rand(n_sims) < p_crisis
                     in_crisis = np.logical_or(in_crisis, new_c)
@@ -129,19 +135,19 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
                 asset_values *= np.exp(step_rets)
                 
-                # --- ACTUALIZAR PEAK RV (Para detectar Drawdown) ---
-                rv_current = asset_values[:, rv_idx]
-                rv_peak_values = np.maximum(rv_peak_values, rv_current)
-                # Drawdown actual de RV: (Peak - Actual) / Peak
-                # Evitar div por cero
-                rv_drawdown = np.zeros_like(rv_current)
-                mask_peak_pos = rv_peak_values > 0
-                rv_drawdown[mask_peak_pos] = (rv_peak_values[mask_peak_pos] - rv_current[mask_peak_pos]) / rv_peak_values[mask_peak_pos]
+                # --- ACTUALIZAR SHADOW BENCHMARK (RV) ---
+                # Aplicamos el retorno de RV al índice fantasma
+                shadow_rv_index *= np.exp(step_rets[:, rv_idx])
+                shadow_rv_peak = np.maximum(shadow_rv_peak, shadow_rv_index)
                 
-                # Definimos "Trouble" si hay crisis manual O si RV está > 10% bajo agua
-                is_rv_underwater = rv_drawdown > 0.10 # Umbral de dolor 10%
-                sim_in_trouble = np.logical_or(in_crisis, is_rv_underwater)
-                # ---------------------------------------------------
+                # Calcular Drawdown de Mercado REAL (Sin efecto de retiros)
+                market_drawdown = (shadow_rv_peak - shadow_rv_index) / shadow_rv_peak
+                
+                # Definir "Trouble" basado puramente en el mercado
+                # Si el mercado ha caído > 10% desde su máximo, es zona de peligro.
+                is_market_crash = market_drawdown > 0.10
+                sim_in_trouble = np.logical_or(in_crisis, is_market_crash)
+                # ----------------------------------------
 
                 current_year = t / 12
 
@@ -149,9 +155,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 if self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * 12):
                     if self.cfg.inmo_strategy == 'portfolio':
                         injection = self.cfg.net_inmo_value * cpi_paths[:, t]
-                        asset_values[:, 0] += injection # A RV para luego rebalancear
-                        # Actualizar peak para que la inyección no cuente como ganancia súbita falsa
-                        rv_peak_values = np.maximum(rv_peak_values, asset_values[:, 0])
+                        asset_values[:, 0] += injection 
 
                 total_cap = np.sum(asset_values, axis=1)
                 current_real_wealth = total_cap / cpi_paths[:, t]
@@ -182,19 +186,18 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 debug_net_flow[t] = np.median(net_cashflow)
                 withdrawal_needed = -net_cashflow 
                 
-                # --- SMART BUCKETS LOGIC V6.3 ---
-                # 1. Superávit -> Invertir en RV
+                # --- SMART BUCKETS LOGIC ---
+                rf_idx = 1; rv_idx = 0
+                
                 mask_surplus = withdrawal_needed <= 0
                 if np.any(mask_surplus):
                     asset_values[mask_surplus, rv_idx] += -withdrawal_needed[mask_surplus]
 
-                # 2. Déficit -> Retirar
                 mask_deficit = withdrawal_needed > 0
                 if np.any(mask_deficit):
                     wd_req = withdrawal_needed[mask_deficit]
                     
                     if self.cfg.use_smart_buckets:
-                        # Sacar de RF primero SIEMPRE que se pueda
                         rf_bal = asset_values[mask_deficit, rf_idx]
                         take_rf = np.minimum(wd_req, rf_bal)
                         take_rv = wd_req - take_rf
@@ -205,17 +208,15 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         ratio_d = np.divide(wd_req, tot_d, out=np.zeros_like(tot_d), where=tot_d!=0)
                         asset_values[mask_deficit] *= (1 - ratio_d[:, np.newaxis])
 
-                # 6. REBALANCEO INTELIGENTE
+                # 6. REBALANCEO (BASADO EN SHADOW BENCHMARK)
                 is_sale_event = (self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * 12))
                 
                 if (t % 12 == 0) or is_sale_event:
                     if self.cfg.use_smart_buckets:
-                        # REGLA DE ORO: NO vender RV si está en Drawdown (>10% bajo agua)
-                        # Solo rebalanceamos los escenarios donde RV está "sana" (~sim_in_trouble)
-                        rebalance_mask = ~sim_in_trouble
+                        # Usamos sim_in_trouble que ahora viene del MERCADO, no del saldo
+                        rebalance_mask = ~sim_in_trouble 
                         
                         if np.any(rebalance_mask):
-                            # Rebalanceo estándar para los "sanos"
                             vals_ok = asset_values[rebalance_mask]
                             tot_ok = np.sum(vals_ok, axis=1)
                             alive_ok = tot_ok > 0
@@ -224,9 +225,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                                 tgt_rv = tot_ok * self.assets[rv_idx].weight
                                 asset_values[rebalance_mask, rf_idx] = tgt_rf
                                 asset_values[rebalance_mask, rv_idx] = tgt_rv
-                                # Nota: Los que están en "trouble" NO se tocan. Dejan correr la RV para recuperar.
                     else:
-                        # Rebalanceo tonto (siempre)
                         tot = np.sum(asset_values, axis=1)
                         alive = tot > 0
                         if np.any(alive):
@@ -284,7 +283,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
         st.divider()
         st.markdown("### 🧠 Seguridad")
-        use_smart = st.checkbox("🥛 Smart Buckets (Anti-Rebalanceo)", value=True, help="No vende RV si está en Drawdown (>10%). Usa RF para gastos.")
+        use_smart = st.checkbox("🥛 Smart Buckets (Cash Buffer)", value=True, help="En crisis, saca dinero SOLO de Renta Fija para no vender acciones barato.")
         use_guard = st.checkbox("🛡️ Guardrails", value=True)
         use_fat = st.checkbox("📉 Fat Tails", value=True)
         use_bond = st.checkbox("🔄 Bonos Reales", value=True)
@@ -343,7 +342,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         sim = InstitutionalSimulator(cfg, assets, wds)
         sim.corr_matrix = np.array([[1.0, 0.25], [0.25, 1.0]])
         
-        with st.spinner("Procesando Lógica Institucional..."):
+        with st.spinner("Corriendo Simulación Institucional..."):
             paths, cpi, ruin_idx, annuity_val, deb_net = sim.run()
             final_nom = paths[:, -1]
             success = np.mean(final_nom > 0) * 100
