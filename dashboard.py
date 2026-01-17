@@ -38,7 +38,7 @@ def cargar_datos():
                 if "afp" in t or "apv" in t: return "RENTA VARIABLE"
                 if "acciones" in n or "equity" in n or "agresivo" in n or "fondo a" in n: return "RENTA VARIABLE"
                 if "bonos" in n or "deuda" in n or "conservador" in n or "uf" in n: return "RENTA FIJA (INV)"
-                if "mixto" in n or "moderado" in n: return "RENTA VARIABLE"
+                if "mixto" in n or "moderado" in n: return "RENTA VARIABLE" # Simplificación
                 return "OTROS ACTIVOS"
 
             df["Categoria_Global"] = df.apply(clasificar_global, axis=1)
@@ -60,22 +60,22 @@ df_cartera, macro_data, fecha_corte = cargar_datos()
 uf_val = macro_data.get("uf_promedio", 39600)
 tc_val = macro_data.get("dolar_observado_promedio", 930)
 
-# --- CÁLCULO PATRIMONIAL PREVIO ---
+# --- CÁLCULO PATRIMONIAL ---
 valor_prop_uf_default = 14500
 deuda_hipo_clp_default = 0
 
 if df_cartera is not None and not df_cartera.empty:
-    # Calcular deuda hipotecaria real del JSON
     deuda_hipo_uf = df_cartera[df_cartera["tipo"] == "Pasivo Inmobiliario"]["saldo_nominal"].sum()
     deuda_hipo_clp_default = deuda_hipo_uf * uf_val
 
-# Calcular Patrimonio Inmobiliario Neto (Para pasarlo al simulador)
 neto_inmo_estimado = (valor_prop_uf_default * uf_val) - deuda_hipo_clp_default
 
 if df_cartera is not None and not df_cartera.empty:
     grp = df_cartera.groupby("bucket_sim")["saldo_clp"].sum()
     st.session_state.datos_cargados = {
-        'rf': grp.get("RF", 0), 'mx': grp.get("MX", 0), 'rv': grp.get("RV", 0),
+        'rf': grp.get("RF", 0), 
+        'mx': grp.get("MX", 0), 
+        'rv': grp.get("RV", 0),
         'usd': df_cartera[df_cartera["moneda"]=="USD"]["saldo_nominal"].sum(),
         'tc': tc_val,
         'inmo_neto': neto_inmo_estimado 
@@ -88,7 +88,6 @@ def render_home():
     st.title("Panel Gestión Patrimonial")
     st.caption(f"📅 Corte: {fecha_corte}")
     
-    # Calcular total rápido para mostrar
     if df_cartera is not None:
         activos = df_cartera[df_cartera["Categoria_Global"]!="PASIVO"]["saldo_clp"].sum()
         pasivos = df_cartera[df_cartera["Categoria_Global"]=="PASIVO"]["saldo_clp"].sum()
@@ -104,12 +103,12 @@ def render_home():
             st.session_state.vista_actual = 'SIMULADOR'; st.rerun()
     with c2:
         if st.button("📊 VER DETALLE", use_container_width=True):
-            st.info("Aquí iría la vista de seguimiento detallada.")
+            st.info("Próximamente")
 
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # Pasamos los datos al motor
+    # PASO DE PARAMETROS CRITICOS
     simulador.app(
         default_rf=d.get('rf',0), 
         default_mx=d.get('mx', 0), 
