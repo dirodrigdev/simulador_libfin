@@ -104,7 +104,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             # Estado para Mean Reversion
             rf_drift_state = np.zeros(n_sims) 
 
-            # Inicializar max_real_wealth antes del loop para evitar UnboundLocalError
+            # FIX: Inicializar max_real_wealth FUERA del loop
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
 
             for t in range(1, n_steps + 1):
@@ -162,7 +162,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
                 total_cap = np.sum(asset_values, axis=1)
                 
-                # Definir current_real_wealth aquí para evitar error de variable no definida
+                # FIX: Actualizar max_real_wealth DENTRO del loop
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
 
