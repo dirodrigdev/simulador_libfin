@@ -1,3 +1,4 @@
+# NOMBRE DEL ARCHIVO: simulador.py
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -19,7 +20,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         "Mis Datos 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
     }
 
-    # Inicializar Inputs
     if "in_inf" not in st.session_state: st.session_state.in_inf = 3.0
     if "in_rf" not in st.session_state: st.session_state.in_rf = default_ret_rf
     if "in_rv" not in st.session_state: st.session_state.in_rv = default_ret_rv
@@ -50,13 +50,15 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         horizon_years: int = 40; steps_per_year: int = 12; initial_capital: float = 1_000_000; n_sims: int = 2000
         inflation_mean: float = 0.035; inflation_vol: float = 0.01; prob_crisis: float = 0.05
         crisis_drift: float = 0.75; crisis_vol: float = 1.25
-        # MOTORES AVANZADOS (B, C, D)
+        # MOTORES AVANZADOS
         use_fat_tails: bool = True
         use_mean_reversion: bool = True
         use_guardrails: bool = True
         guardrail_trigger: float = 0.15; guardrail_cut: float = 0.10
-        # ESTRATEGIA INMOBILIARIA
+        # ESTRATEGIA INMOBILIARIA V5.4
         sell_year: int = 0; net_inmo_value: float = 0; new_rent_cost: float = 0
+        inmo_strategy: str = "portfolio" # 'portfolio' (invertir) o 'annuity' (consumir)
+        annuity_rate: float = 0.05 # Tasa real de la anualidad (ej 5%)
 
     class InstitutionalSimulator:
         def __init__(self, config, assets, withdrawals):
@@ -75,20 +77,32 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             asset_values = np.zeros((n_sims, n_assets))
             for i, a in enumerate(self.assets): asset_values[:, i] = self.cfg.initial_capital * a.weight
 
-            # Cholesky
             try: L = np.linalg.cholesky(self.corr_matrix)
             except: L = np.eye(n_assets)
-            
             p_crisis = 1 - (1 - self.cfg.prob_crisis)**self.dt
             in_crisis = np.zeros(n_sims, dtype=bool)
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
+
+            # Pre-cálculo de Anualidad (Si aplica)
+            annuity_monthly_payout_real = 0
+            if self.cfg.sell_year > 0 and self.cfg.inmo_strategy == 'annuity':
+                years_remaining = self.cfg.horizon_years - self.cfg.sell_year
+                if years_remaining > 0:
+                    months = years_remaining * 12
+                    r_monthly = self.cfg.annuity_rate / 12
+                    # Fórmula PMT: P = PV * r * (1+r)^n / ((1+r)^n - 1)
+                    if r_monthly > 0:
+                        factor = (1 + r_monthly)**months
+                        annuity_monthly_payout_real = self.cfg.net_inmo_value * (r_monthly * factor) / (factor - 1)
+                    else:
+                        annuity_monthly_payout_real = self.cfg.net_inmo_value / months
 
             for t in range(1, n_steps + 1):
                 # 1. INFLACIÓN
                 inf_shock = np.random.normal(self.cfg.inflation_mean * self.dt, self.cfg.inflation_vol * np.sqrt(self.dt), n_sims)
                 cpi_paths[:, t] = cpi_paths[:, t-1] * (1 + inf_shock)
                 
-                # 2. CRISIS & FAT TAILS (D)
+                # 2. CRISIS & FAT TAILS
                 new_c = np.random.rand(n_sims) < p_crisis
                 in_crisis = np.logical_or(in_crisis, new_c)
                 in_crisis[np.random.rand(n_sims) < 0.15] = False 
@@ -99,68 +113,85 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 else: z_uncorr = np.random.normal(0, 1, (n_sims, n_assets))
                 z_corr = np.dot(z_uncorr, L.T)
                 
-                # 3. RETORNOS ACTIVOS (C - MEAN REVERSION)
+                # 3. RETORNOS
                 step_rets = np.zeros((n_sims, n_assets))
                 for i, asset in enumerate(self.assets):
                     mu, sig = asset.mu_nominal, asset.sigma_nominal
                     if np.any(in_crisis): mu *= self.cfg.crisis_drift; sig *= self.cfg.crisis_vol
-                    
-                    # Lógica C: Mean Reversion para Bonos
-                    step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
+                    if self.cfg.use_mean_reversion and asset.is_bond:
+                        # Mean Reversion simplificado en el drift
+                        step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
+                    else:
+                        step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                 
                 asset_values *= np.exp(step_rets)
                 
-                # 4. EVENTO INMOBILIARIO (VENTA)
-                # Si estamos en el mes exacto de la venta
                 current_year = t / 12
+
+                # 4. EVENTO VENTA CASA (Solo si es estrategia 'portfolio' inyectamos capital)
                 if self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * 12):
-                    # Inyectamos capital: Valor Casa * Inflación acumulada
-                    injection = self.cfg.net_inmo_value * cpi_paths[:, t]
-                    # Distribuimos la inyección según pesos actuales (o rebalanceo forzoso)
-                    # Simplificación: Sumamos al total y rebalanceamos abajo
-                    total_pre_inject = np.sum(asset_values, axis=1)
-                    # Evitar div por 0
-                    mask_pos = total_pre_inject > 0
-                    # Proporción actual
-                    # Mejor estrategia: Inyectar manteniendo el mix objetivo o rebalancear todo
-                    # Vamos a sumar al pool y dejar que el rebalanceo (paso 6) lo ordene
-                    # Pero necesitamos asignarlo a los buckets ahora para que 'total_cap' suba
-                    # Asignamos temporalmente al primer activo líquido (RV) para que el rebalanceo lo distribuya luego
-                    asset_values[:, 0] += injection
+                    if self.cfg.inmo_strategy == 'portfolio':
+                        injection = self.cfg.net_inmo_value * cpi_paths[:, t]
+                        # Inyectar al primer activo (se rebalancea luego)
+                        asset_values[:, 0] += injection
+                    # Si es 'annuity', NO inyectamos el capital al pozo. Lo usamos para pagar cuotas.
 
                 total_cap = np.sum(asset_values, axis=1)
                 
-                # 5. RETIROS & GUARDRAILS (B)
+                # 5. RETIROS NETOS
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
                 
-                # Buscar Retiro Base
+                # Buscar Retiro Base del periodo
                 wd_base_start = 0
                 for w in self.withdrawals:
                     if w.from_year <= current_year < w.to_year:
                         wd_base_start = w.amount_nominal_monthly_start; break
                 
-                # AJUSTE: Si ya vendimos la casa, sumamos el costo de arriendo al retiro base
+                # APLICAR LÓGICA INMOBILIARIA
+                # A partir del año de venta: +Costo Arriendo
                 if self.cfg.sell_year > 0 and current_year >= self.cfg.sell_year:
                     wd_base_start += self.cfg.new_rent_cost
+                    
+                    # Si es 'annuity', RESTAMOS el pago de la anualidad (es un ingreso)
+                    if self.cfg.inmo_strategy == 'annuity':
+                        # El pago es real, lo ajustamos a nominal hoy
+                        # wd_base_start es nominal base (t=0). 
+                        # Debemos restar el payout real al base nominal para que luego se infle todo junto?
+                        # Mejor: Restamos el payout nominalizado del retiro nominalizado final.
+                        pass # Se aplica abajo en wd_nom
 
-                # Aplicar Guardrails
+                # Calcular Retiro Nominal Final
                 if self.cfg.use_guardrails:
                     drawdown = (max_real_wealth - current_real_wealth) / max_real_wealth
                     in_trouble = drawdown > self.cfg.guardrail_trigger
-                    wd_nom = np.zeros(n_sims)
-                    wd_nom[~in_trouble] = wd_base_start * cpi_paths[~in_trouble, t]
-                    wd_nom[in_trouble] = (wd_base_start * cpi_paths[in_trouble, t]) * (1.0 - self.cfg.guardrail_cut)
-                else: wd_nom = np.full(n_sims, wd_base_start) * cpi_paths[:, t]
+                    
+                    # Factor de inflación (Guardrails pueden congelarlo, pero aquí simplificamos con recorte directo)
+                    wd_nom_base = np.zeros(n_sims)
+                    wd_nom_base[~in_trouble] = wd_base_start * cpi_paths[~in_trouble, t]
+                    wd_nom_base[in_trouble] = (wd_base_start * cpi_paths[in_trouble, t]) * (1.0 - self.cfg.guardrail_cut)
+                else:
+                    wd_nom_base = np.full(n_sims, wd_base_start) * cpi_paths[:, t]
 
-                ratio = np.divide(wd_nom, total_cap, out=np.zeros_like(total_cap), where=total_cap!=0)
-                ratio = np.clip(ratio, 0, 1)
+                # DESCUENTO POR ANUALIDAD (INGRESO)
+                if self.cfg.sell_year > 0 and current_year >= self.cfg.sell_year and self.cfg.inmo_strategy == 'annuity':
+                    # El payout de la anualidad crece con inflación (para mantener poder adquisitivo real cte)
+                    # O es nominal fijo? Normalmente Renta Vitalicia es en UF (Real).
+                    annuity_payout_nom = annuity_monthly_payout_real * cpi_paths[:, t]
+                    wd_nom_final = wd_nom_base - annuity_payout_nom
+                else:
+                    wd_nom_final = wd_nom_base
+
+                # Ejecutar retiro (puede ser negativo si la anualidad > gastos, lo que implica ahorro)
+                ratio = np.divide(wd_nom_final, total_cap, out=np.zeros_like(total_cap), where=total_cap!=0)
+                # Si ratio es negativo (ingreso neto), asset_values crece (>1). Si es positivo, decrece (<1).
+                # Limitamos retiro máximo a 100% (quiebra), pero no limitamos ahorro (negativo).
+                ratio = np.minimum(ratio, 1.0) 
+                
                 asset_values *= (1 - ratio[:, np.newaxis])
                 
                 # 6. REBALANCEO Y RUINA
-                # Rebalanceamos anualmente O si hubo evento de venta inmobiliaria
                 is_sale_event = (self.cfg.sell_year > 0 and t == int(self.cfg.sell_year * 12))
-                
                 if t % 12 == 0 or is_sale_event:
                     tot = np.sum(asset_values, axis=1)
                     alive = tot > 0
@@ -174,14 +205,14 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 just_died = (capital_paths[:, t-1] > 0) & (capital_paths[:, t] <= 1000)
                 ruin_indices[just_died] = t
                 
-            return capital_paths, cpi_paths, ruin_indices
+            return capital_paths, cpi_paths, ruin_indices, annuity_monthly_payout_real
 
     def clean(lbl, d, k): 
         v = st.text_input(lbl, value=f"{int(d):,}".replace(",", "."), key=k)
         return int(re.sub(r'\D', '', v)) if v else 0
     def fmt(v): return f"{int(v):,}".replace(",", ".")
 
-    # --- 3. UI ---
+    # --- UI ---
     st.markdown("""
     <style>
         div.stButton > button[kind="primary"] {
@@ -208,18 +239,27 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         sell_prop = st.checkbox("Vender Propiedad Futura", value=False)
         if sell_prop:
             net_inmo_val = st.number_input("Valor Neto Hoy ($)", value=int(default_inmo_neto))
-            sale_year = st.slider("Año de Venta", 1, 40, 10, help="Año en que vendes la casa, recibes el capital y empiezas a pagar arriendo.")
+            sale_year = st.slider("Año de Venta", 1, 40, 10)
             rent_cost = st.number_input("Nuevo Arriendo ($/mes)", value=1500000, step=100000)
-            st.info(f"En el Año {sale_year}: Recibes capital (ajustado IPC) y tu gasto sube en ${fmt(rent_cost)}/mes.")
+            
+            # NUEVO: Selector de Estrategia
+            st.markdown("#### ¿Qué hacer con el dinero?")
+            strat_mode = st.radio("Destino Capital:", ["Invertir en Portafolio", "Consumir (Anualidad)"], index=1, help="Invertir: Se suma a tus activos y sigue rentando. Consumir: Se calcula una cuota para gastarlo todo hasta el año 40.")
+            
+            inmo_strat_code = 'portfolio' if "Invertir" in strat_mode else 'annuity'
+            
+            if inmo_strat_code == 'annuity':
+                annuity_rate_ui = st.number_input("Tasa Rentabilidad Casa (%)", value=5.0, step=0.1, help="A qué tasa inviertes el dinero de la casa mientras te lo vas gastando.")
+            else: annuity_rate_ui = 0.0
+            
         else:
-            net_inmo_val, sale_year, rent_cost = 0, 0, 0
+            net_inmo_val, sale_year, rent_cost, inmo_strat_code, annuity_rate_ui = 0, 0, 0, 'portfolio', 0
 
         st.divider()
         st.markdown("### 🧠 Seguridad Institucional")
-        # Aquí confirmamos que tus "motores perdidos" están presentes
-        use_guard = st.checkbox("🛡️ Guardrails (Gasto Dinámico)", value=True, help="Reduce gasto si hay crisis (Punto B).")
-        use_fat = st.checkbox("📉 Fat Tails (T-Student)", value=True, help="Eventos extremos reales (Punto D).")
-        use_bond = st.checkbox("🔄 Bonos Reales (Mean Rev)", value=True, help="Matemática de bonos correcta (Punto C).")
+        use_guard = st.checkbox("🛡️ Guardrails", value=True)
+        use_fat = st.checkbox("📉 Fat Tails", value=True)
+        use_bond = st.checkbox("🔄 Bonos Reales", value=True)
         
         if use_guard:
             c1, c2 = st.columns(2)
@@ -238,17 +278,23 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     c1, c2, c3 = st.columns(3)
     with c1: 
         cap_input = clean("Capital Inversión ($)", ini_def, "cap")
-        if sell_prop: st.caption(f"+ Casa en Año {sale_year}")
+        if sell_prop and inmo_strat_code == 'portfolio': 
+            st.success(f"Año {sale_year}: Se inyectan ${fmt(net_inmo_val)}")
+        elif sell_prop:
+            st.info(f"Año {sale_year}: Se genera Renta Mensual")
+            
     with c2: pct_rv = st.slider("% Renta Variable", 0, 100, 60)
     with c3: 
         st.metric("Mix", f"{100-pct_rv}% RF / {pct_rv}% RV")
-        st.caption(f"RF: {p_rf}% | RV: {p_rv}%")
+        st.caption(f"Nominales: RF {p_rf}% | RV {p_rv}%")
 
     st.markdown("### 💸 Plan de Retiro (Nominal Hoy)")
     g1, g2, g3 = st.columns(3)
     with g1: r1 = clean("Fase 1 ($)", 6000000, "r1"); d1 = st.number_input("Años", 7)
     with g2: r2 = clean("Fase 2 ($)", 5500000, "r2"); d2 = st.number_input("Años", 13)
     with g3: r3 = clean("Fase 3 ($)", 5000000, "r3"); st.caption("Resto vida")
+    
+    if sell_prop: st.warning(f"⚠️ Nota: El costo de arriendo (${fmt(rent_cost)}) se sumará a tus gastos desde el año {sale_year}.")
 
     if st.button("🚀 EJECUTAR ANÁLISIS PRO", type="primary"):
         assets = [
@@ -260,34 +306,33 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             WithdrawalTramo(d1, d1+d2, r2),
             WithdrawalTramo(d1+d2, horiz, r3)
         ]
-        # Configuración V5.3 Completa
         cfg = SimulationConfig(
             horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, 
             inflation_mean=p_inf/100, prob_crisis=p_cris/100,
             use_guardrails=use_guard, guardrail_trigger=gr_trigger/100.0, guardrail_cut=gr_cut/100.0,
             use_fat_tails=use_fat, use_mean_reversion=use_bond,
-            # Estrategia Inmobiliaria
-            sell_year=sale_year, net_inmo_value=net_inmo_val, new_rent_cost=rent_cost
+            # Estrategia Inmobiliaria V5.4
+            sell_year=sale_year, net_inmo_value=net_inmo_val, new_rent_cost=rent_cost,
+            inmo_strategy=inmo_strat_code, annuity_rate=annuity_rate_ui/100.0
         )
         
         sim = InstitutionalSimulator(cfg, assets, wds)
         sim.corr_matrix = np.array([[1.0, 0.25], [0.25, 1.0]])
         
-        with st.spinner("Procesando Escenarios Institucionales..."):
-            paths, cpi, ruin_idx = sim.run()
+        with st.spinner("Procesando Escenarios Avanzados..."):
+            paths, cpi, ruin_idx, annuity_val = sim.run()
             final_nom = paths[:, -1]
             success = np.mean(final_nom > 0) * 100
             median_legacy = np.median(final_nom / cpi[:, -1])
             
-            # Cálculo de Ruina (Inicio del 80% de riesgo)
             fails = ruin_idx[ruin_idx > -1]
-            if len(fails) > 0:
-                fail_years = fails / 12
-                # Percentil 20 = Inicio del 80% grueso
-                start_80_pct = np.percentile(fail_years, 20)
-            else: start_80_pct = 0
+            start_80_pct = np.percentile(fails/12, 20) if len(fails) > 0 else 0
             
-            st.session_state.current_results = {"succ": success, "leg": median_legacy, "paths": paths, "ruin_start": start_80_pct, "n_fails": len(fails)}
+            st.session_state.current_results = {
+                "succ": success, "leg": median_legacy, "paths": paths, 
+                "ruin_start": start_80_pct, "n_fails": len(fails),
+                "annuity_val": annuity_val
+            }
 
     if st.session_state.current_results:
         res = st.session_state.current_results
@@ -300,18 +345,17 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         </div>
         """, unsafe_allow_html=True)
         
-        # Dashboard de Riesgo
         c1, c2, c3 = st.columns(3)
-        c1.metric("Probabilidad de Ruina", f"{100-res['succ']:.1f}%", help="Riesgo total de agotar fondos.")
+        c1.metric("Probabilidad de Ruina", f"{100-res['succ']:.1f}%")
         val_ruin = f"Año {res['ruin_start']:.1f}" if res['n_fails'] > 0 else "Nunca"
         c2.metric("Inicio Riesgo (80%)", val_ruin, help="El 80% de las quiebras ocurren después de este año.")
         
-        if sell_prop:
-            c3.success(f"Venta Casa: Año {sale_year}")
-        else:
-            c3.caption("Estrategia: Mantener Casa")
+        if sell_prop and inmo_strat_code == 'annuity':
+            c3.metric("Sueldo Inmobiliario (UF+5%)", f"${fmt(res['annuity_val'])}/mes", help="Ingreso mensual generado al consumir la casa.")
+            st.success(f"💡 Tu casa paga el arriendo (${fmt(rent_cost)}) y te sobran **${fmt(res['annuity_val'] - rent_cost)}** extra para gastar.")
+        elif sell_prop:
+            c3.info("Capital Inyectado al Portafolio")
 
-        # Gráfico
         y = np.arange(res["paths"].shape[1])/12
         p10, p50, p90 = np.percentile(res["paths"], 10, axis=0), np.percentile(res["paths"], 50, axis=0), np.percentile(res["paths"], 90, axis=0)
         
@@ -319,14 +363,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         fig.add_trace(go.Scatter(x=y, y=p50, line=dict(color='#3b82f6', width=3), name='Mediana'))
         fig.add_trace(go.Scatter(x=y, y=p10, line=dict(width=0), showlegend=False))
         fig.add_trace(go.Scatter(x=y, y=p90, fill='tonexty', fillcolor='rgba(59, 130, 246, 0.1)', line=dict(width=0), name='Rango 80%'))
-        
-        # Marcador de venta
-        if sell_prop and sale_year > 0:
-            fig.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta Casa")
-        
-        # Marcador de riesgo
-        if res['n_fails'] > 0:
-            fig.add_vline(x=res['ruin_start'], line_dash="dot", line_color="red", annotation_text="Inicio Riesgo")
-            
-        fig.update_layout(title="Evolución Patrimonial", yaxis_title="Capital Nominal", height=450)
+        if sell_prop and sale_year > 0: fig.add_vline(x=sale_year, line_dash="dash", line_color="green", annotation_text="Venta Casa")
+        if res['n_fails'] > 0: fig.add_vline(x=res['ruin_start'], line_dash="dot", line_color="red", annotation_text="Inicio Riesgo")
         st.plotly_chart(fig, use_container_width=True)
