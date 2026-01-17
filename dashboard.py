@@ -78,7 +78,7 @@ if df_cartera is not None and not df_cartera.empty:
         'rf': grp.get("RF", 0), 'mx': grp.get("MX", 0), 'rv': grp.get("RV", 0),
         'usd': df_cartera[df_cartera["moneda"]=="USD"]["saldo_nominal"].sum(),
         'tc': tc_val,
-        'inmo_neto': neto_inmo_estimado # <--- DATO CLAVE
+        'inmo_neto': neto_inmo_estimado 
     }
 
 def fmt(v, s="$"): return f"{s} {v:,.0f}".replace(",", ".")
@@ -92,9 +92,6 @@ def render_home():
     if df_cartera is not None:
         activos = df_cartera[df_cartera["Categoria_Global"]!="PASIVO"]["saldo_clp"].sum()
         pasivos = df_cartera[df_cartera["Categoria_Global"]=="PASIVO"]["saldo_clp"].sum()
-        # Ajuste manual inmo (sumar valor casa, restar deuda ya incluida en pasivos, sumar riesgo)
-        # Simplificado para visualización rápida:
-        pn_approx = (activos - pasivos) + neto_inmo_estimado # Aprox
         
         k1, k2 = st.columns(2)
         k1.metric("Patrimonio Financiero (Liq)", fmt(activos - pasivos))
@@ -112,13 +109,14 @@ def render_home():
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # Pasamos los datos al motor
+    # Pasamos los datos al motor (INCLUYENDO MX QUE FALTABA)
     simulador.app(
         default_rf=d.get('rf',0), 
+        default_mx=d.get('mx', 0), # <--- Corrección Auditada V6.7
         default_rv=d.get('rv',0), 
         default_usd_nominal=d.get('usd',0), 
         default_tc=d.get('tc',930),
-        default_inmo_neto=d.get('inmo_neto', 0) # <--- Aquí pasa el valor de la casa
+        default_inmo_neto=d.get('inmo_neto', 0)
     )
 
 if st.session_state.vista_actual == 'HOME': render_home()
