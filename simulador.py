@@ -39,15 +39,15 @@ class SimulationConfig:
     enable_prop: bool = False
     net_inmo_value: float = 0
     new_rent_cost: float = 0
-    emergency_months_trigger: int = 24  # Vender si queda capital para < 24 meses
-    forced_sale_year: int = 0 # Opcional: Vender sí o sí en este año si no se ha vendido antes
+    emergency_months_trigger: int = 24  
+    forced_sale_year: int = 0 
     
     # Crisis
     mu_local_rv: float = -0.15; mu_local_rf: float = 0.08; corr_local: float = -0.25  
     mu_global_rv: float = -0.35; mu_global_rf: float = -0.06; corr_global: float = 0.90   
     prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085  
 
-# --- 2. MOTOR DE SIMULACIÓN V9 (EMERGENCY TRIGGER) ---
+# --- 2. MOTOR DE SIMULACIÓN V9 (CORREGIDO) ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config
@@ -81,17 +81,12 @@ class InstitutionalSimulator:
         n_sims, n_steps = self.cfg.n_sims, self.total_steps
         n_assets = len(self.assets)
         
-        # Inicialización
         capital_paths = np.zeros((n_sims, n_steps + 1))
         capital_paths[:, 0] = self.cfg.initial_capital
         cpi_paths = np.ones((n_sims, n_steps + 1))
         
-        # Estados
         is_alive = np.ones(n_sims, dtype=bool) 
         ruin_indices = np.full(n_sims, -1) 
-        
-        # Estado Inmobiliario: ¿Tiene casa aún?
-        # Si enable_prop es True, todos empiezan con casa (has_house = True)
         has_house = np.full(n_sims, self.cfg.enable_prop, dtype=bool)
         
         asset_values = np.zeros((n_sims, n_assets))
@@ -105,7 +100,6 @@ class InstitutionalSimulator:
         
         current_regime = np.zeros(n_sims, dtype=int)
 
-        # Generación de Ruido (White Box Approved)
         df = 8 
         G = np.random.normal(0, 1, (n_sims, n_steps, n_assets))
         W = np.random.chisquare(df, (n_sims, n_steps, 1)) / df
@@ -118,10 +112,9 @@ class InstitutionalSimulator:
 
         z_final = np.zeros((n_sims, n_assets))
 
-        # --- BUCLE TEMPORAL ---
         for t in range(n_steps):
             
-            # 1. ACTUALIZAR RÉGIMEN (Markov)
+            # 1. ACTUALIZAR RÉGIMEN
             if np.any(is_alive):
                 mask_0 = (current_regime == 0) & is_alive
                 if np.any(mask_0):
@@ -142,8 +135,7 @@ class InstitutionalSimulator:
                     idx_c = np.where(mask_crisis)[0]
                     current_regime[idx_c[back_to_norm]] = 0
 
-            # 2. CALCULAR GASTO NOMINAL BASE PARA ESTE MES
-            # Necesario para saber si activamos el gatillo de emergencia
+            # 2. GASTO BASE
             spy = self.cfg.steps_per_year
             current_year = (t+1) / spy
             
@@ -152,14 +144,13 @@ class InstitutionalSimulator:
                 if w.from_year <= current_year < w.to_year:
                     monthly_spend_base = w.amount_nominal_monthly_start; break
             
-            # Ajuste inflación
             current_inf_shock = inf_shocks[:, t]
             current_inf_shock[current_regime == 1] += 0.003 
             cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + np.maximum(current_inf_shock, -0.02))
             
             monthly_spend_nom = monthly_spend_base * cpi_paths[:, t+1]
 
-            # 3. RETORNOS DE MERCADO
+            # 3. RETORNOS
             z_final.fill(0.0)
             z_t = Z_raw[:, t, :]
             
@@ -177,67 +168,40 @@ class InstitutionalSimulator:
             step_rets = np.clip(step_rets, -0.6, 0.6) 
             asset_values[is_alive] *= np.exp(step_rets[is_alive])
 
-            # 4. GATILLO DE EMERGENCIA (Lógica Crítica)
-            # Calculamos capital total actual
+            # 4. GATILLO DE EMERGENCIA
             total_cap_now = np.sum(asset_values, axis=1)
-            
-            # Umbral de pánico: ¿Me quedan menos de X meses de vida?
-            # Umbral = Gasto Mensual * Meses de Gatillo (ej. 24)
             panic_threshold = monthly_spend_nom * self.cfg.emergency_months_trigger
             
-            # Condición: Vivo + Tiene Casa + Capital < Umbral
-            # O Condición 2: Vivo + Tiene Casa + Llegamos al año de venta forzada (si está configurado)
             forced_time = (self.cfg.forced_sale_year > 0) and ((t+1) >= int(self.cfg.forced_sale_year * spy))
-            
             trigger_mask = is_alive & has_house & ((total_cap_now < panic_threshold) | forced_time)
             
             if np.any(trigger_mask):
-                # VENDER LA CASA
                 sale_value = self.cfg.net_inmo_value * cpi_paths[trigger_mask, t+1]
-                # Inyectamos cash al bucket de menor riesgo (Defensa) o prorrata.
-                # Simplificación: Inyectamos al bucket de activos 0 (RV) o 1 (RF), 
-                # lo ideal es a RF pero el código genérico suma todo. 
-                # Lo sumaremos al bucket 0 para que entre al pool general.
                 asset_values[trigger_mask, 0] += sale_value
-                
-                # Marcar que ya no tienen casa
                 has_house[trigger_mask] = False
 
             # 5. RETIROS Y ARRIENDOS
-            # Guardrails (Reducen gasto si mercado cae, pero no afecta arriendo)
-            living_nom = np.full(n_sims, monthly_spend_nom) # Copia para modificar
+            living_nom = np.full(n_sims, monthly_spend_nom)
             
             if self.cfg.use_guardrails:
-                 # Recalcular riqueza real post-retorno y post-venta casa
                  curr_real_wealth = np.sum(asset_values, axis=1) / cpi_paths[:, t+1]
                  dd_initial = (self.cfg.initial_capital - curr_real_wealth) / self.cfg.initial_capital
                  living_nom[dd_initial > 0.20] *= (1.0 - self.cfg.guardrail_cut)
 
-            # Costo de Arriendo: Solo si NO tiene casa (ya la vendió o nunca tuvo)
-            # Y si enable_prop estaba activo originalmente.
             rent_nom = np.zeros(n_sims)
-            
-            # Si se activó la opción inmobiliaria, los que no tienen casa pagan arriendo.
             if self.cfg.enable_prop:
-                # Quienes ya vendieron (o nunca tuvieron) pagan arriendo
                 payers_mask = is_alive & (~has_house)
                 rent_nom[payers_mask] = self.cfg.new_rent_cost * cpi_paths[payers_mask, t+1]
             
-            # Flujo Neto
             total_outflow = living_nom + rent_nom
             
-            # 6. EJECUCIÓN DE RETIROS
-            # Prorrateo simple o smart buckets
+            # 6. EJECUCIÓN
             total_cap_pre_wd = np.sum(asset_values, axis=1)
-            
-            # Evitar retirar más de lo que hay
             wd_actual = np.minimum(total_outflow, total_cap_pre_wd)
             
-            # Restar del pool
             mask_wd = (wd_actual > 0) & is_alive
             if np.any(mask_wd):
                 if self.cfg.use_smart_buckets:
-                    # Sacar primero de RF
                     rf_bal = np.maximum(asset_values[mask_wd, rf_idx], 0)
                     take_rf = np.minimum(wd_actual[mask_wd], rf_bal)
                     take_rv = wd_actual[mask_wd] - take_rf
@@ -247,7 +211,7 @@ class InstitutionalSimulator:
                     ratio = wd_actual[mask_wd] / total_cap_pre_wd[mask_wd]
                     asset_values[mask_wd] *= (1 - ratio[:, np.newaxis])
 
-            # 7. CHEQUEO DE MUERTE (RUINA FINAL)
+            # 7. CHEQUEO DE MUERTE
             asset_values = np.maximum(asset_values, 0)
             capital_paths[:, t+1] = np.sum(asset_values, axis=1)
             
@@ -273,7 +237,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
     st.markdown("## 🦅 Panel de Decisión (Motor V9)")
     st.markdown("**Lógica de Supervivencia:** Si el capital cae peligrosamente, la casa se vende automáticamente para inyectar liquidez.")
 
-    # ESCENARIOS
     SCENARIOS_GLOBAL = {
         "Colapso Sistémico (Recomendado)": {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.35, "desc": "⚠️ No hay refugio. Inflación + Recesión."},
         "Crash Financiero (Tipo 2008)": {"corr": 0.70, "rf_ret": -0.02, "rv_ret": -0.30, "desc": "Todo cae, salvo el cash."},
@@ -316,7 +279,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
     with g2: r2 = clean("Fase 2", 5500000, "r2"); d2 = st.number_input("Años F2", 0, 40, 13)
     with g3: r3 = clean("Fase 3", 5000000, "r3"); st.caption("Resto")
     
-    # --- SECCIÓN INMOBILIARIA V9 ---
     st.markdown("### 🚨 Estrategia de Emergencia (Inmobiliaria)")
     enable_prop = st.checkbox("Activar Respaldo Inmobiliario", value=False)
     
@@ -326,11 +288,8 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             val_inmo = clean("Valor Neto Propiedad ($)", default_inmo_neto, "v_inmo")
             rent_cost = clean("Costo Arriendo (si vendo) ($)", 1500000, "v_rent")
         with c_inmo2:
-            trigger_months = st.slider("Gatillo de Venta (Meses de Gasto)", 6, 60, 24, 
-                                     help="Si tu capital baja de X meses de gastos, la casa se vende AUTOMÁTICAMENTE.")
-            st.caption(f"Si te quedan menos de {trigger_months} meses de vida financiera, el sistema vende la casa para salvarte.")
-            
-            forced_sale = st.checkbox("Forzar venta en año específico (opcional)", value=False)
+            trigger_months = st.slider("Gatillo de Venta (Meses de Gasto)", 6, 60, 24)
+            forced_sale = st.checkbox("Forzar venta en año específico", value=False)
             forced_year = 0
             if forced_sale:
                 forced_year = st.slider("Año Venta Forzada", 1, 40, 30)
@@ -349,7 +308,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims,
             use_guardrails=use_guard, 
             
-            # PARÁMETROS V9
             enable_prop=enable_prop,
             net_inmo_value=val_inmo, 
             new_rent_cost=rent_cost, 
@@ -365,8 +323,11 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
         sim = InstitutionalSimulator(cfg, assets, wds)
         
         with st.spinner(f"Simulando {n_sims} vidas con Gatillo de Emergencia..."):
-            paths, cpi, ruin_idx, _, _ = sim.run()
+            paths, cpi, ruin_indices, _, _ = sim.run()
             
+            # --- FIX: AQUÍ ESTABA EL ERROR DE NOMBRE ---
+            # Antes decía 'failures = np.sum(ruin_indices > -1)', pero usábamos 'ruin_idx' al desempaquetar.
+            # Ahora hemos desempaquetado directamente como 'ruin_indices' arriba.
             failures = np.sum(ruin_indices > -1)
             success_prob = (1 - (failures / n_sims)) * 100
             
@@ -398,7 +359,7 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             fig.update_layout(title="Proyección Patrimonial", xaxis_title="Años", yaxis_title="Patrimonio ($)", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
             
-            fails = ruin_idx[ruin_idx > -1]
+            fails = ruin_indices[ruin_indices > -1]
             if len(fails) > 0:
                 first_fail = np.percentile(fails/12, 10)
                 st.error(f"💀 Ruina temprana: {first_fail:.1f} años (incluso con venta de casa).")
