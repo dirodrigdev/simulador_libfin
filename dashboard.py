@@ -2,10 +2,7 @@ import streamlit as st
 import json
 import os
 import pandas as pd
-import plotly.express as px
 import simulador 
-import shutil
-from datetime import datetime
 
 st.set_page_config(page_title="Gestión Patrimonial", layout="wide", page_icon="🏦")
 
@@ -19,7 +16,7 @@ if 'datos_cargados' not in st.session_state: st.session_state.datos_cargados = {
 
 # --- CARGA DE DATOS ---
 @st.cache_data
-def cargar_y_clasificar_datos():
+def cargar_datos():
     if not os.path.exists(FILE_MENSUAL): return None, {}, "Error: Archivo no encontrado"
     try:
         with open(FILE_MENSUAL, "r", encoding="utf-8") as f: data = json.load(f)
@@ -31,6 +28,7 @@ def cargar_y_clasificar_datos():
             for col in cols_num:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
+            # Clasificador
             def clasificar_global(row):
                 t = str(row.get("tipo", "")).lower(); n = str(row.get("nombre", "")).lower()
                 if "pasivo" in t or "hipoteca" in t: return "PASIVO"
@@ -45,6 +43,7 @@ def cargar_y_clasificar_datos():
 
             df["Categoria_Global"] = df.apply(clasificar_global, axis=1)
             
+            # Buckets para Simulador
             def bucket_sim(row):
                 cat = row["Categoria_Global"]
                 if row["moneda"] == "USD" and cat == "LIQUIDEZ": return "USD"
@@ -55,22 +54,22 @@ def cargar_y_clasificar_datos():
             df["bucket_sim"] = df.apply(bucket_sim, axis=1)
 
         return df, reg.get("macro", {}), reg.get("fecha_dato", "N/A")
-    except Exception as e:
-        return None, {}, "Error"
+    except Exception as e: return None, {}, "Error"
 
-df_cartera, macro_data, fecha_corte = cargar_y_clasificar_datos()
+df_cartera, macro_data, fecha_corte = cargar_datos()
 uf_val = macro_data.get("uf_promedio", 39600)
 tc_val = macro_data.get("dolar_observado_promedio", 930)
 
-# CÁLCULO PATRIMONIAL PREVIO PARA CARGAR DATOS
-# Necesitamos calcular el Neto Inmobiliario para pasarlo al simulador
-valor_prop_uf_default = 14500 # Default si no hay input
+# --- CÁLCULO PATRIMONIAL PREVIO ---
+valor_prop_uf_default = 14500
 deuda_hipo_clp_default = 0
 
 if df_cartera is not None and not df_cartera.empty:
+    # Calcular deuda hipotecaria real del JSON
     deuda_hipo_uf = df_cartera[df_cartera["tipo"] == "Pasivo Inmobiliario"]["saldo_nominal"].sum()
     deuda_hipo_clp_default = deuda_hipo_uf * uf_val
 
+# Calcular Patrimonio Inmobiliario Neto (Para pasarlo al simulador)
 neto_inmo_estimado = (valor_prop_uf_default * uf_val) - deuda_hipo_clp_default
 
 if df_cartera is not None and not df_cartera.empty:
@@ -79,94 +78,48 @@ if df_cartera is not None and not df_cartera.empty:
         'rf': grp.get("RF", 0), 'mx': grp.get("MX", 0), 'rv': grp.get("RV", 0),
         'usd': df_cartera[df_cartera["moneda"]=="USD"]["saldo_nominal"].sum(),
         'tc': tc_val,
-        'inmo_neto': neto_inmo_estimado # Nuevo dato
-    }
-
-def calcular_totales(df, val_prop_uf, deuda_tc_clp):
-    if df is None: return {}
-    deuda_hipo_uf = df[df["tipo"] == "Pasivo Inmobiliario"]["saldo_nominal"].sum()
-    deuda_hipo_clp = deuda_hipo_uf * uf_val
-    pasivos_totales = deuda_hipo_clp + deuda_tc_clp
-    df_act = df[df["Categoria_Global"] != "PASIVO"]
-    mapa_activos = df_act.groupby("Categoria_Global")["saldo_clp"].sum().to_dict()
-    riesgo_json = mapa_activos.get("INV. RIESGO (*)", 0)
-    riesgo_manual = 380000 * tc_val if riesgo_json == 0 else 0
-    total_riesgo = riesgo_json + riesgo_manual
-    activo_inmo_clp = val_prop_uf * uf_val
-    mapa_activos["INMOBILIARIO"] = activo_inmo_clp
-    mapa_activos["INV. RIESGO (*)"] = total_riesgo
-    activos_brutos = sum(mapa_activos.values())
-    patrimonio_neto = activos_brutos - pasivos_totales
-    
-    return {
-        "activos_brutos": activos_brutos,
-        "pasivos_totales": pasivos_totales,
-        "patrimonio_neto": patrimonio_neto,
-        "pn_sin_especulativos": patrimonio_neto - total_riesgo,
-        "mapa_activos": mapa_activos,
-        "neto_inmo": activo_inmo_clp - deuda_hipo_clp,
-        "neto_liq": mapa_activos.get("LIQUIDEZ", 0) - deuda_tc_clp,
-        "deuda_hipo_clp": deuda_hipo_clp,
-        "dividendo_uf": df[df["tipo"]=="Pasivo Inmobiliario"]["valor_cuota"].sum()
+        'inmo_neto': neto_inmo_estimado # <--- DATO CLAVE
     }
 
 def fmt(v, s="$"): return f"{s} {v:,.0f}".replace(",", ".")
 
+# --- VISTAS ---
 def render_home():
-    res = calcular_totales(df_cartera, 14500, 93500000)
-    pn = res.get("patrimonio_neto", 0)
-    
-    # Actualizar el neto inmo en session state con el cálculo preciso
-    st.session_state.datos_cargados['inmo_neto'] = res.get("neto_inmo", 0)
-
     st.title("Panel Gestión Patrimonial")
     st.caption(f"📅 Corte: {fecha_corte}")
     
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Patrimonio Neto Real", fmt(pn))
-    k2.metric("En Dólares", fmt(pn/tc_val, "US$ "))
-    
-    st.markdown("---")
-    c1, c2, c3 = st.columns(3)
-    with c1: 
-        if st.button("📊 MIX PATRIMONIAL", use_container_width=True): st.session_state.vista_actual = 'SEGUIMIENTO'; st.rerun()
-    with c2: 
-        if st.button("🔮 SIMULADOR PRO", type="primary", use_container_width=True): st.session_state.vista_actual = 'SIMULADOR'; st.rerun()
-    with c3: 
-        if st.button("✅ VALIDACIÓN", use_container_width=True): st.session_state.vista_actual = 'VALIDACION'; st.rerun()
+    # Calcular total rápido para mostrar
+    if df_cartera is not None:
+        activos = df_cartera[df_cartera["Categoria_Global"]!="PASIVO"]["saldo_clp"].sum()
+        pasivos = df_cartera[df_cartera["Categoria_Global"]=="PASIVO"]["saldo_clp"].sum()
+        # Ajuste manual inmo (sumar valor casa, restar deuda ya incluida en pasivos, sumar riesgo)
+        # Simplificado para visualización rápida:
+        pn_approx = (activos - pasivos) + neto_inmo_estimado # Aprox
+        
+        k1, k2 = st.columns(2)
+        k1.metric("Patrimonio Financiero (Liq)", fmt(activos - pasivos))
+        k2.metric("Inmobiliario Neto Est.", fmt(neto_inmo_estimado))
 
-def render_seguimiento():
-    if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
-    with st.sidebar:
-        val_prop_uf = st.number_input("Valor Prop (UF)", value=14500)
-        deuda_tc = st.number_input("Deuda TC", value=93500000)
-    
-    res = calcular_totales(df_cartera, val_prop_uf, deuda_tc)
-    st.title("📑 Informe Mix")
-    st.dataframe(pd.DataFrame([
-        ["Activos", fmt(res["activos_brutos"])],
-        ["Pasivos", fmt(res["pasivos_totales"])],
-        ["Patrimonio Neto", fmt(res["patrimonio_neto"])]
-    ], columns=["Concepto", "Monto"]), use_container_width=True)
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+    with c1: 
+        if st.button("🔮 IR AL SIMULADOR", type="primary", use_container_width=True): 
+            st.session_state.vista_actual = 'SIMULADOR'; st.rerun()
+    with c2:
+        if st.button("📊 VER DETALLE", use_container_width=True):
+            st.info("Aquí iría la vista de seguimiento detallada.")
 
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # Pasamos el neto inmobiliario
+    # Pasamos los datos al motor
     simulador.app(
         default_rf=d.get('rf',0), 
         default_rv=d.get('rv',0), 
         default_usd_nominal=d.get('usd',0), 
         default_tc=d.get('tc',930),
-        default_inmo_neto=d.get('inmo_neto', 0) # <--- NUEVO
+        default_inmo_neto=d.get('inmo_neto', 0) # <--- Aquí pasa el valor de la casa
     )
 
-def render_validacion():
-    if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
-    st.title("🔍 Validación")
-    st.dataframe(df_cartera)
-
 if st.session_state.vista_actual == 'HOME': render_home()
-elif st.session_state.vista_actual == 'SEGUIMIENTO': render_seguimiento()
 elif st.session_state.vista_actual == 'SIMULADOR': render_simulador()
-elif st.session_state.vista_actual == 'VALIDACION': render_validacion()
