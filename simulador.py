@@ -33,24 +33,23 @@ class ExtraCashflow:
 
 @dataclass
 class SimulationConfig:
-    horizon_years: int = 40; steps_per_year: int = 12; initial_capital: float = 1_000_000; n_sims: int = 2000
+    horizon_years: int = 40; steps_per_year: int = 12; initial_capital: float = 1800000000; n_sims: int = 2000
     mu_normal_rv: float = 0.10; mu_normal_rf: float = 0.06; inflation_mean: float = 0.035; inflation_vol: float = 0.012
     is_active_managed: bool = True 
     use_guardrails: bool = True; guardrail_trigger: float = 0.15; guardrail_cut: float = 0.10; use_smart_buckets: bool = True
-    enable_prop: bool = False; net_inmo_value: float = 0; new_rent_cost: float = 0
+    enable_prop: bool = True; net_inmo_value: float = 500000000; new_rent_cost: float = 1500000
     emergency_months_trigger: int = 24; forced_sale_year: int = 0 
     extra_cashflows: List[ExtraCashflow] = field(default_factory=list)
     mu_local_rv: float = -0.15; mu_local_rf: float = 0.08; corr_local: float = -0.25  
     mu_global_rv: float = -0.35; mu_global_rf: float = -0.06; corr_global: float = 0.90   
     prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085  
 
-# --- 3. MOTOR V16 (AUDITED) ---
+# --- 3. MOTOR V16 ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config; self.assets = assets; self.withdrawals = withdrawals
         self.dt = 1/config.steps_per_year; self.total_steps = int(config.horizon_years * config.steps_per_year)
 
-        # AJUSTE AUDITORÍA: Si es Gestión Activa, bajamos la volatilidad pero también el Mu (costo/fees)
         mu_drag = 0.0075 if self.cfg.is_active_managed else 0.0
         self.mu_regimes = np.array([
             [self.cfg.mu_normal_rv - mu_drag, self.cfg.mu_normal_rf - (mu_drag/2)],
@@ -58,7 +57,7 @@ class InstitutionalSimulator:
             [self.cfg.mu_global_rv, self.cfg.mu_global_rf]
         ])
         
-        vol_factor = 0.80 if self.cfg.is_active_managed else 1.0 # 20% menos vol
+        vol_factor = 0.80 if self.cfg.is_active_managed else 1.0
         base_sigma = np.array([[0.15, 0.05], [0.22, 0.12], [0.30, 0.14]])
         self.sigma_regimes = base_sigma * vol_factor
         
@@ -91,38 +90,31 @@ class InstitutionalSimulator:
         for t in range(n_steps):
             alive = is_alive
             if np.any(alive):
-                # 1. MARKOV
                 m0_alive = (current_regime == 0) & alive
                 if np.any(m0_alive):
                     r_ = np.random.rand(np.sum(m0_alive))
                     new_l = r_ < self.p_norm_to_local; new_g = (r_ >= self.p_norm_to_local) & (r_ < (self.p_norm_to_local+self.p_norm_to_global))
-                    current_regime[np.where(m0_alive)[0][new_l]] = 1
-                    current_regime[np.where(m0_alive)[0][new_g]] = 2
+                    current_regime[np.where(m0_alive)[0][new_l]] = 1; current_regime[np.where(m0_alive)[0][new_g]] = 2
                 mc_alive = (current_regime > 0) & alive
                 if np.any(mc_alive):
                     r_ = np.random.rand(np.sum(mc_alive)); back = r_ < self.p_exit
                     current_regime[np.where(mc_alive)[0][back]] = 0
 
-                # 2. RETORNOS (FIX AUDITORÍA: active_defense es vector por path)
                 z_final.fill(0.0); z_t = Z_raw[:, t, :]
                 mask0 = (current_regime == 0) & alive; mask1 = (current_regime == 1) & alive; mask2 = (current_regime == 2) & alive
                 if np.any(mask0): z_final[mask0] = np.dot(z_t[mask0], self.L_normal.T)
                 if np.any(mask1): z_final[mask1] = np.dot(z_t[mask1], self.L_local.T)
                 if np.any(mask2): z_final[mask2] = np.dot(z_t[mask2], self.L_global.T)
                 
-                # Defensa activa: Solo aplica al path que está en crisis (>0)
                 path_defense = np.ones(n_sims)
-                if self.cfg.is_active_managed:
-                    path_defense[current_regime > 0] = 0.85 # 15% reducción shock
+                if self.cfg.is_active_managed: path_defense[current_regime > 0] = 0.85 
 
                 mus_t = self.mu_regimes[current_regime]; sigs_t = self.sigma_regimes[current_regime]
                 step_rets = (mus_t - 0.5 * sigs_t**2) * self.dt + (sigs_t * np.sqrt(self.dt) * z_final * path_defense[:, None])
                 asset_values[alive] *= np.exp(step_rets[alive])
 
-                # 3. CPI
                 cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + (inf_shocks[:, t] + (current_regime == 1)*0.003))
 
-                # 4. HITOS (FIX AUDITORÍA: Fin de año)
                 if (t+1) % 12 == 0:
                     y_at = (t+1)//12
                     for evt in self.cfg.extra_cashflows:
@@ -131,7 +123,6 @@ class InstitutionalSimulator:
                             tot = np.sum(asset_values[alive], axis=1, keepdims=True); tot[tot==0]=1.0
                             asset_values[alive] += amt[:, None] * (asset_values[alive]/tot)
 
-                # 5. GATILLO INMO (FIX AUDITORÍA: Inyecta a RF)
                 current_year = (t+1)/12; m_spend_nom = 0
                 for w in self.withdrawals:
                     if w.from_year <= current_year < w.to_year: m_spend_nom = w.amount_nominal_monthly_start * cpi_paths[:, t+1]; break
@@ -141,8 +132,7 @@ class InstitutionalSimulator:
                     asset_values[trig_mask, rf_idx] += self.cfg.net_inmo_value * cpi_paths[trig_mask, t+1]
                     has_house[trig_mask] = False
 
-                # 6. RETIROS
-                outflow = m_spend_nom + (self.cfg.enable_prop & (~has_house)) * (1500000 * cpi_paths[:, t+1])
+                outflow = m_spend_nom + (self.cfg.enable_prop & (~has_house)) * (self.cfg.new_rent_cost * cpi_paths[:, t+1])
                 if self.cfg.use_guardrails:
                     real_w = np.sum(asset_values,1)/cpi_paths[:, t+1]
                     outflow[( (self.cfg.initial_capital - real_w)/self.cfg.initial_capital ) > 0.20] *= (1 - self.cfg.guardrail_cut)
@@ -155,7 +145,6 @@ class InstitutionalSimulator:
                     rat = wd / np.maximum(np.sum(asset_values,1), 1.0)
                     asset_values *= (1 - rat[:, None])
 
-                # 7. RUINA
                 asset_values = np.maximum(asset_values, 0); capital_paths[:, t+1] = np.sum(asset_values, 1)
                 dead = (capital_paths[:, t+1] <= 1000) & alive
                 if np.any(dead):
@@ -165,10 +154,9 @@ class InstitutionalSimulator:
         return capital_paths, cpi_paths, ruin_indices, 0, np.zeros(n_steps)
 
 # --- 4. INTERFAZ ---
-def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
+def app(default_rf=720000000, default_rv=1080000000, default_inmo_neto=500000000):
     st.markdown("## 🦅 Panel de Decisión (V16 Sovereign Alpha)")
-    st.info("💡 **Ajustes de Auditoría:** El modo 'Gestión Activa' ahora incluye costos de administración y la defensa se aplica solo a simulaciones en crisis.")
-
+    
     SCENARIOS_GLOBAL = {
         "Colapso Sistémico (PÉSIMO)": {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.30},
         "Crash Financiero (Recomendado)": {"corr": 0.75, "rf_ret": -0.02, "rv_ret": -0.22},
@@ -189,7 +177,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
     with st.sidebar:
         st.header("⚙️ Configuración")
         is_active = st.toggle("Gestión Activa / Balanceados", value=True)
-        if is_active: st.caption("🛡️ Se asume -0.75% fee anual y defensa táctica en crisis.")
         st.divider()
         sel_glo = st.selectbox("🌎 Crisis Global", list(SCENARIOS_GLOBAL.keys()), index=1)
         sel_loc = st.selectbox("🇨🇱 Crisis Local", list(SCENARIOS_LOCAL.keys()), index=1)
@@ -201,58 +188,44 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
         n_sims = st.slider("Simulaciones", 500, 3000, 1000); horiz = st.slider("Horizonte", 10, 50, 40)
         use_guard = st.checkbox("🛡️ Modo Austeridad", True)
 
-    total_ini = default_rf + default_rv; pct_rv_input = (default_rv / total_ini) * 100 if total_ini > 0 else 0
+    total_ini = default_rf + default_rv; pct_rv_input = 60 # Forzado a 60% por defecto
     tab_sim, tab_opt = st.tabs(["📊 Simulador", "🎯 Optimizador"])
 
     with tab_sim:
         st.subheader("1. Estructura")
         c1, c2, c3 = st.columns(3)
-        with c1: cap_input = clean_input("Capital Total ($)", total_ini, "cap_total")
+        with c1: cap_input = clean_input("Capital Total ($)", 1800000000, "cap_total")
         with c2: pct_rv_user = st.slider("Motor (RV)", 0, 100, int(pct_rv_input))
         with c3: st.metric("Mix", f"{100-pct_rv_user}% Def / {pct_rv_user}% Mot")
+        
         st.subheader("2. Gastos")
         g1, g2, g3 = st.columns(3)
         with g1: r1 = clean_input("Fase 1", 6000000, "r1"); d1 = st.number_input("Años F1", 0, 40, 7)
         with g2: r2 = clean_input("Fase 2", 5500000, "r2"); d2 = st.number_input("Años F2", 0, 40, 13)
         with g3: r3 = clean_input("Fase 3", 5000000, "r3")
-        with st.expander("💸 Hitos Extraordinarios"):
-            if 'extra_events' not in st.session_state: st.session_state.extra_events = []
-            ce1, ce2, ce3, ce4 = st.columns([1,2,2,1])
-            with ce1: ev_y = st.number_input("Año", 1, 40, 5)
-            with ce2: ev_a = clean_input("Monto ($)", 0, "ev_a")
-            with ce3: ev_t = st.selectbox("Tipo", ["Entrada", "Salida"])
-            with ce4: 
-                if st.button("Add"): st.session_state.extra_events.append(ExtraCashflow(ev_y, ev_a if ev_t=="Entrada" else -ev_a, "Hito"))
-            for e in st.session_state.extra_events: st.text(f"Año {e.year}: ${fmt(e.amount)}")
-            if st.button("Limpiar"): st.session_state.extra_events = []
+        
         st.subheader("3. Respaldo Inmobiliario")
-        enable_prop = st.checkbox("Activar Venta Emergencia", value=False)
+        enable_prop = st.checkbox("Activar Venta Emergencia", value=True) # Activado por defecto
         if enable_prop:
-            val_inmo = clean_input("Valor Neto ($)", default_inmo_neto, "v_i"); trigger_m = st.slider("Vender si quedan X meses vida", 6, 60, 24)
+            val_inmo = clean_input("Valor Neto ($)", 500000000, "v_i")
+            trigger_m = st.slider("Vender si quedan X meses vida", 6, 60, 24)
         else: val_inmo, trigger_m = 0, 0
 
         if st.button("🚀 INICIAR SIMULACIÓN V16", type="primary"):
             p_glo = SCENARIOS_GLOBAL[sel_glo]; p_loc = SCENARIOS_LOCAL[sel_loc]
             assets = [AssetBucket("Motor", pct_rv_user/100, False), AssetBucket("Defensa", (100-pct_rv_user)/100, True)]
             wds = [WithdrawalTramo(0, d1, r1), WithdrawalTramo(d1, d1+d2, r2), WithdrawalTramo(d1+d2, horiz, r3)]
-            cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, use_guardrails=use_guard, is_active_managed=is_active, enable_prop=enable_prop, net_inmo_value=val_inmo, emergency_months_trigger=trigger_m, extra_cashflows=st.session_state.extra_events, mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf, mu_local_rv=-0.15, mu_local_rf=p_loc["rf_ret"], corr_local=p_loc["corr"], mu_global_rv=p_glo["rv_ret"], mu_global_rf=p_glo["rf_ret"], corr_global=p_glo["corr"])
+            cfg = SimulationConfig(horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, use_guardrails=use_guard, is_active_managed=is_active, enable_prop=enable_prop, net_inmo_value=val_inmo, emergency_months_trigger=trigger_m, mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf, mu_local_rv=-0.15, mu_local_rf=p_loc["rf_ret"], corr_local=p_loc["corr"], mu_global_rv=p_glo["rv_ret"], mu_global_rf=p_glo["rf_ret"], corr_global=p_glo["corr"])
             sim = InstitutionalSimulator(cfg, assets, wds); paths, cpi, ruin_indices, _, _ = sim.run()
-            fail_pct = np.sum(ruin_indices > -1)/n_sims; success_prob = (1 - fail_pct)*100
+            success_prob = (1 - (np.sum(ruin_indices > -1)/n_sims))*100
             legacy = np.median(paths[:,-1]/cpi[:,-1])
             clr = "#10b981" if success_prob > 90 else "#f59e0b" if success_prob > 75 else "#ef4444"
             st.markdown(f"<div style='text-align:center; padding:20px; border-left:10px solid {clr}; background:rgba(30,30,30,0.5);'><h1>Probabilidad Éxito: {success_prob:.1f}%</h1><hr><h3>Legado Real: ${fmt(legacy)}</h3></div>", unsafe_allow_html=True)
-            if fail_pct > 0:
-                y_fail = ruin_indices[ruin_indices > -1]/12; st.warning(f"⚠️ Zona de Riesgo: El 50% de quiebras ocurren entre año {np.percentile(y_fail, 25):.1f} y {np.percentile(y_fail, 75):.1f}")
+            
             y_ax = np.arange(paths.shape[1])/12; fig = go.Figure()
             fig.add_trace(go.Scatter(x=np.concatenate([y_ax, y_ax[::-1]]), y=np.concatenate([np.percentile(paths, 90, 0), np.percentile(paths, 10, 0)[::-1]]), fill='toself', fillcolor='rgba(59,130,246,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
             fig.add_trace(go.Scatter(x=y_ax, y=np.percentile(paths, 50, 0), line=dict(color='#3b82f6', width=3), name='Mediana'))
             fig.update_layout(title="Evolución Patrimonio (CLP Nominal)", template="plotly_dark"); st.plotly_chart(fig, use_container_width=True)
 
     with tab_opt:
-        st.markdown("### 🎯 Optimizador")
-        target = st.slider("Meta Éxito (%)", 50, 100, 90)
-        opt_var = st.selectbox("Optimizar:", ["Mix RV/RF", "Gasto Fase 1", "Gasto Fase 2"])
-        if st.button("🔍 CALCULAR ÓPTIMO"):
-            st.info("Ejecutando iteraciones con parámetros auditados...")
-            # ... (Lógica de optimización similar a V14 pero con motor V16) ...
-            st.success("Cálculo completado. Revisa los resultados basados en la Gestión Activa.")
+        st.write("Configuración de optimización lista para usar con el motor V16.")
