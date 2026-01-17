@@ -38,7 +38,7 @@ def cargar_datos():
                 if "afp" in t or "apv" in t: return "RENTA VARIABLE"
                 if "acciones" in n or "equity" in n or "agresivo" in n or "fondo a" in n: return "RENTA VARIABLE"
                 if "bonos" in n or "deuda" in n or "conservador" in n or "uf" in n: return "RENTA FIJA (INV)"
-                if "mixto" in n or "moderado" in n: return "RENTA VARIABLE" # Simplificación
+                if "mixto" in n or "moderado" in n: return "RENTA VARIABLE"
                 return "OTROS ACTIVOS"
 
             df["Categoria_Global"] = df.apply(clasificar_global, axis=1)
@@ -108,7 +108,7 @@ def render_home():
 def render_simulador():
     if st.sidebar.button("🏠 Volver"): st.session_state.vista_actual = 'HOME'; st.rerun()
     d = st.session_state.datos_cargados
-    # PASO DE PARAMETROS CRITICOS
+    # PASO DE PARAMETROS AL SIMULADOR
     simulador.app(
         default_rf=d.get('rf',0), 
         default_mx=d.get('mx', 0), 
