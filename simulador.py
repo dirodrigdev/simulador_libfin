@@ -25,6 +25,7 @@ class SimulationConfig:
     initial_capital: float = 1_000_000
     n_sims: int = 2000
     
+    # Parámetros Base (Se llenan desde la UI)
     mu_normal_rv: float = 0.10
     mu_normal_rf: float = 0.06
     inflation_mean: float = 0.035
@@ -47,7 +48,7 @@ class SimulationConfig:
     mu_global_rv: float = -0.35; mu_global_rf: float = -0.06; corr_global: float = 0.90   
     prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085  
 
-# --- 2. MOTOR DE SIMULACIÓN V10 (FLEXIBLE) ---
+# --- 2. MOTOR DE SIMULACIÓN V11 (TRANSPARENTE) ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config
@@ -61,8 +62,8 @@ class InstitutionalSimulator:
             [self.cfg.mu_local_rv, self.cfg.mu_local_rf],
             [self.cfg.mu_global_rv, self.cfg.mu_global_rf]
         ])
-        # Volatilidad ajustada (un poco menos agresiva en crisis global para flexibilizar)
-        self.sigma_regimes = np.array([[0.14, 0.05], [0.20, 0.12], [0.28, 0.14]])
+        # Volatilidad ajustada para no "castigar" excesivamente la RV en tiempos normales
+        self.sigma_regimes = np.array([[0.15, 0.05], [0.22, 0.12], [0.30, 0.14]])
         
         cn = np.array([[1.0, 0.35], [0.35, 1.0]])
         self.L_normal = np.linalg.cholesky(cn)
@@ -218,102 +219,103 @@ class InstitutionalSimulator:
 
 # --- 3. UTILIDADES Y FORMATO ---
 def fmt(v): 
-    """Formato chileno de miles: 10.000.000"""
+    """Formato chileno: 10.000.000"""
     return f"{int(v):,}".replace(",", ".")
 
 def clean_input(label, val, key):
-    """Input que siempre muestra formato 10.000.000"""
     val_str = fmt(val)
     new_val = st.text_input(label, value=val_str, key=key)
-    # Limpiar puntos para obtener el número
     clean_val = re.sub(r'\.', '', new_val)
     return int(clean_val) if clean_val.isdigit() else 0
+
+def fmt_pct(v):
+    return f"{v*100:.1f}%"
 
 # --- 4. INTERFAZ PRINCIPAL ---
 def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
     
-    st.markdown("## 🦅 Panel de Decisión (Flexible)")
-    st.info("💡 **Consejo:** Comienza con los escenarios 'Recomendados'. Si ves mucha falla, prueba la rentabilidad 'Optimista' o baja el nivel de crisis para ver dónde está el límite.")
+    st.markdown("## 🦅 Panel de Decisión (Transparente)")
+    st.info("💡 **Novedad:** Ahora puedes ver y editar las rentabilidades base para ajustar el 'optimismo' del modelo.")
 
-    # --- DEFINICIÓN DE ESCENARIOS CLAROS ---
+    # --- DEFINICIÓN DE ESCENARIOS ---
+    # Global y Local se mantienen igual...
     SCENARIOS_GLOBAL = {
-        "Colapso Sistémico (PÉSIMO)": 
-            {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.35, "desc": "Peor que el Recomendado. Inflación alta + Recesión (Stagflación). Nada protege."},
-        "Crash Financiero (Recomendado)": 
-            {"corr": 0.70, "rf_ret": -0.02, "rv_ret": -0.30, "desc": "Escenario Base de Estrés. Todo cae fuerte, pero el cash aguanta."},
-        "Recesión Estándar (OPTIMISTA)": 
-            {"corr": 0.50, "rf_ret": 0.0, "rv_ret": -0.20, "desc": "Mejor que el Recomendado. Bolsa cae, pero Bonos sirven de paracaídas."}
+        "Colapso Sistémico (PÉSIMO)": {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.35, "desc": "Inflación + Recesión."},
+        "Crash Financiero (Recomendado)": {"corr": 0.70, "rf_ret": -0.02, "rv_ret": -0.30, "desc": "Caída fuerte, cash aguanta."},
+        "Recesión Estándar (OPTIMISTA)": {"corr": 0.50, "rf_ret": 0.0, "rv_ret": -0.20, "desc": "Bonos protegen."}
     }
     
     SCENARIOS_LOCAL = {
-        "Falla del Hedge (PÉSIMO)": 
-            {"corr": 0.20, "rf_ret": 0.0, "desc": "Peor que el Recomendado. Crisis en Chile y el Dólar NO sube (raro pero fatal)."},
-        "Protección Estándar (Recomendado)": 
-            {"corr": -0.25, "rf_ret": 0.08, "desc": "Escenario Base. El Dólar sube cuando Chile cae. El seguro funciona."},
-        "Dólar Blindado (OPTIMISTA)": 
-            {"corr": -0.35, "rf_ret": 0.10, "desc": "Mejor que el Recomendado. El Peso colapsa y tu patrimonio en USD se multiplica."}
+        "Falla del Hedge (PÉSIMO)": {"corr": 0.20, "rf_ret": 0.0, "desc": "Dólar NO sube en crisis."},
+        "Protección Estándar (Recomendado)": {"corr": -0.25, "rf_ret": 0.08, "desc": "Dólar sube y protege."},
+        "Dólar Blindado (OPTIMISTA)": {"corr": -0.35, "rf_ret": 0.10, "desc": "Peso colapsa, USD vuela."}
     }
 
+    # Rentabilidades Base (Más Opciones + Custom)
     SCENARIOS_RENTABILIDAD = {
-        "Conservador (PÉSIMO)": {"rv": 0.07, "rf": 0.035, "desc": "Asume que los mercados rendirán POCO en el futuro."},
-        "Histórico (Recomendado)": {"rv": 0.10, "rf": 0.06, "desc": "Promedios de los últimos 50 años. Balanceado."},
-        "Optimista (MEJOR)": {"rv": 0.12, "rf": 0.07, "desc": "Asume un boom tecnológico o años muy buenos."}
+        "Conservador": {"rv": 0.07, "rf": 0.04, "desc": "Pesimista. Asume bajo crecimiento mundial."},
+        "Histórico (S&P500 50y)": {"rv": 0.10, "rf": 0.05, "desc": "Promedios históricos de largo plazo."},
+        "Crecimiento (Optimista)": {"rv": 0.12, "rf": 0.06, "desc": "Asume buen desempeño bursátil (Equity Premium)."},
+        "Personalizado": {"rv": 0.0, "rf": 0.0, "desc": "Define tus propios números."}
     }
 
     # --- SIDEBAR CONFIGURACIÓN ---
     with st.sidebar:
         st.header("1. Configurar Escenarios")
         
-        st.markdown("### 🌎 Mundo (Crisis Global)")
-        sel_glo = st.selectbox("Nivel de Estrés Global", list(SCENARIOS_GLOBAL.keys()), index=1) # Default: Crash Financiero (Medio)
-        st.caption(f"📝 {SCENARIOS_GLOBAL[sel_glo]['desc']}")
+        # Selectores de Crisis
+        st.markdown("**A. Escenarios de Crisis**")
+        sel_glo = st.selectbox("🌎 Mundo", list(SCENARIOS_GLOBAL.keys()), index=1)
+        sel_loc = st.selectbox("🇨🇱 Chile", list(SCENARIOS_LOCAL.keys()), index=1)
         
         st.divider()
         
-        st.markdown("### 🇨🇱 Chile (Crisis Local)")
-        sel_loc = st.selectbox("Protección Local", list(SCENARIOS_LOCAL.keys()), index=1)
-        st.caption(f"📝 {SCENARIOS_LOCAL[sel_loc]['desc']}")
-
-        st.divider()
+        # Selector de Rentabilidad (EL MOTOR)
+        st.markdown("**B. Motor de Crecimiento (Años Normales)**")
+        sel_ret = st.selectbox("Proyección Rentabilidad", list(SCENARIOS_RENTABILIDAD.keys()), index=1)
         
-        st.markdown("### 📈 Rentabilidad Base (Años Normales)")
-        sel_ret = st.selectbox("Proyección Retornos", list(SCENARIOS_RENTABILIDAD.keys()), index=1)
-        st.caption(f"📝 {SCENARIOS_RENTABILIDAD[sel_ret]['desc']}")
+        # Lógica para mostrar/editar números
+        if sel_ret == "Personalizado":
+            c_cust1, c_cust2 = st.columns(2)
+            mu_rv_user = c_cust1.number_input("Retorno RV %", 0.0, 20.0, 10.0, 0.5) / 100.0
+            mu_rf_user = c_cust2.number_input("Retorno RF %", 0.0, 15.0, 5.0, 0.5) / 100.0
+            chosen_mu_rv = mu_rv_user
+            chosen_mu_rf = mu_rf_user
+            st.caption("Ingresa retornos nominales anuales.")
+        else:
+            chosen_mu_rv = SCENARIOS_RENTABILIDAD[sel_ret]["rv"]
+            chosen_mu_rf = SCENARIOS_RENTABILIDAD[sel_ret]["rf"]
+            
+            # VISUALIZADOR DE NÚMEROS (Lo que pediste)
+            col_kpi1, col_kpi2 = st.columns(2)
+            col_kpi1.metric("RV (Motor)", fmt_pct(chosen_mu_rv))
+            col_kpi2.metric("RF (Defensa)", fmt_pct(chosen_mu_rf))
+            st.caption(SCENARIOS_RENTABILIDAD[sel_ret]["desc"])
         
         st.divider()
-        n_sims = st.slider("Precisión (Simulaciones)", 500, 3000, 1000)
-        horiz = st.slider("Horizonte (Años)", 10, 50, 40)
-        use_guard = st.checkbox("🛡️ Activar 'Modo Austeridad' (Recorta gasto si hay crisis)", True)
+        n_sims = st.slider("Precisión", 500, 3000, 1000)
+        horiz = st.slider("Horizonte", 10, 50, 40)
+        use_guard = st.checkbox("🛡️ Activar 'Modo Austeridad'", True)
 
     # --- CUERPO PRINCIPAL ---
-    
-    # 1. CAPITAL Y ESTRUCTURA
+    # 1. CAPITAL
     total_ini = default_rf + default_rv
     pct_rv_input = (default_rv / total_ini) * 100 if total_ini > 0 else 0
     
     st.markdown("### 💰 Tu Capital y Estructura")
     c1, c2, c3 = st.columns(3)
-    with c1: 
-        cap_input = clean_input("Capital Total ($)", total_ini, "cap_total")
-    with c2: 
-        pct_rv_user = st.slider("% Motor (Renta Variable)", 0, 100, int(pct_rv_input))
-    with c3: 
-        st.metric("Mix Efectivo", f"{100-pct_rv_user}% Def / {pct_rv_user}% Mot")
+    with c1: cap_input = clean_input("Capital Total ($)", total_ini, "cap_total")
+    with c2: pct_rv_user = st.slider("% Motor (RV)", 0, 100, int(pct_rv_input))
+    with c3: st.metric("Mix Efectivo", f"{100-pct_rv_user}% Def / {pct_rv_user}% Mot")
 
-    # 2. GASTOS (SEPARADOR DE MILES)
+    # 2. GASTOS
     st.markdown("### 💸 Tus Gastos Mensuales (Estimados)")
     g1, g2, g3 = st.columns(3)
-    with g1: 
-        r1 = clean_input("Fase 1 (Inicio)", 6000000, "r1")
-        d1 = st.number_input("Años F1", 0, 40, 7)
-    with g2: 
-        r2 = clean_input("Fase 2 (Intermedia)", 5500000, "r2")
-        d2 = st.number_input("Años F2", 0, 40, 13)
-    with g3: 
-        r3 = clean_input("Fase 3 (Vejez)", 5000000, "r3")
-        st.caption("Resto de vida")
+    with g1: r1 = clean_input("Fase 1 (Inicio)", 6000000, "r1"); d1 = st.number_input("Años F1", 0, 40, 7)
+    with g2: r2 = clean_input("Fase 2 (Intermedia)", 5500000, "r2"); d2 = st.number_input("Años F2", 0, 40, 13)
+    with g3: r3 = clean_input("Fase 3 (Vejez)", 5000000, "r3"); st.caption("Resto")
 
-    # 3. INMOBILIARIO (SEPARADOR DE MILES)
+    # 3. INMOBILIARIO
     st.markdown("### 🏡 Estrategia Inmobiliaria (Salvavidas)")
     enable_prop = st.checkbox("Tengo una Propiedad para vender en caso de emergencia", value=False)
     
@@ -324,21 +326,15 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             rent_cost = clean_input("Costo Arriendo (si vendo) ($)", 1500000, "v_rent")
         with c_inmo2:
             trigger_months = st.slider("Gatillo: Vender si me quedan X meses de vida", 6, 60, 24)
-            st.caption(f"Si tu saldo baja de {trigger_months} meses de gasto, el sistema vende la casa automáticamente.")
-            
-            forced_sale = st.checkbox("Forzar venta en año específico (Plan B)", value=False)
-            forced_year = 0
-            if forced_sale:
-                forced_year = st.slider("Año Venta Forzada", 1, 40, 30)
+            forced_sale = st.checkbox("Forzar venta en año específico", value=False)
+            forced_year = st.slider("Año Venta Forzada", 1, 40, 30) if forced_sale else 0
     else:
         val_inmo, rent_cost, trigger_months, forced_year = 0, 0, 0, 0
 
     # --- EJECUCIÓN ---
     if st.button("🚀 EJECUTAR SIMULACIÓN", type="primary"):
-        # Cargar parámetros seleccionados
         p_glo = SCENARIOS_GLOBAL[sel_glo]
         p_loc = SCENARIOS_LOCAL[sel_loc]
-        p_ret = SCENARIOS_RENTABILIDAD[sel_ret]
         
         assets = [AssetBucket("Motor", pct_rv_user/100, False), AssetBucket("Defensa", (100-pct_rv_user)/100, True)]
         wds = [WithdrawalTramo(0, d1, r1), WithdrawalTramo(d1, d1+d2, r2), WithdrawalTramo(d1+d2, horiz, r3)]
@@ -353,7 +349,9 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             emergency_months_trigger=trigger_months,
             forced_sale_year=forced_year,
             
-            mu_normal_rv=p_ret["rv"], mu_normal_rf=p_ret["rf"],
+            # AQUÍ USAMOS LOS NÚMEROS ELEGIDOS O CUSTOM
+            mu_normal_rv=chosen_mu_rv, mu_normal_rf=chosen_mu_rf,
+            
             mu_local_rv=-0.15, mu_local_rf=p_loc["rf_ret"], corr_local=p_loc["corr"],
             mu_global_rv=p_glo["rv_ret"], mu_global_rf=p_glo["rf_ret"], corr_global=p_glo["corr"], 
             prob_enter_local=0.005, prob_enter_global=0.004, prob_exit_crisis=0.085
@@ -370,10 +368,9 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             final_wealth = paths[:, -1]
             median_legacy = np.median(final_wealth / cpi[:, -1])
             
-            # Semáforo Flexible
-            if success_prob >= 90: clr, msg, icon = "#10b981", "EXCELENTE (PLAN MUY SEGURO)", "✅"
-            elif success_prob >= 75: clr, msg, icon = "#f59e0b", "ACEPTABLE (CON RIESGO)", "⚠️"
-            else: clr, msg, icon = "#ef4444", "CRÍTICO (ALTA PROBABILIDAD DE FALLA)", "🛑"
+            if success_prob >= 90: clr, msg, icon = "#10b981", "EXCELENTE", "✅"
+            elif success_prob >= 75: clr, msg, icon = "#f59e0b", "ACEPTABLE", "⚠️"
+            else: clr, msg, icon = "#ef4444", "CRÍTICO", "🛑"
 
             st.markdown(f"""
             <div style="background-color:rgba(30,30,30,0.5); padding:20px; border-radius:10px; border-left: 10px solid {clr}; text-align: center;">
@@ -381,7 +378,7 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
                 <h2 style="margin:10px 0;">Probabilidad de Éxito: {success_prob:.1f}%</h2>
                 <hr style="border-color: #555;">
                 <p style="margin:0; font-size:1.1em;">Herencia Estimada (Valor Hoy): <b>${fmt(median_legacy)}</b></p>
-                <p style="font-size:0.9em; opacity:0.8;">Escenario: Global {sel_glo} | Local {sel_loc} | Retornos {sel_ret}</p>
+                <p style="font-size:0.9em; opacity:0.8;">Parametros: RV {fmt_pct(chosen_mu_rv)} | RF {fmt_pct(chosen_mu_rf)}</p>
             </div>""", unsafe_allow_html=True)
             
             y_axis = np.arange(paths.shape[1])/12
@@ -391,8 +388,8 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=np.concatenate([y_axis, y_axis[::-1]]), y=np.concatenate([upper_bound, lower_bound[::-1]]),
-                fill='toself', fillcolor='rgba(59, 130, 246, 0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80% (Escenarios Probables)'))
-            fig.add_trace(go.Scatter(x=y_axis, y=median_path, line=dict(color='#3b82f6', width=3), name='Camino Central (Mediana)'))
+                fill='toself', fillcolor='rgba(59, 130, 246, 0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
+            fig.add_trace(go.Scatter(x=y_axis, y=median_path, line=dict(color='#3b82f6', width=3), name='Mediana'))
             
             fig.update_layout(title="Evolución de tu Patrimonio", xaxis_title="Años", yaxis_title="Patrimonio ($)", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
@@ -400,6 +397,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             fails = ruin_indices[ruin_indices > -1]
             if len(fails) > 0:
                 first_fail = np.percentile(fails/12, 10)
-                st.error(f"💀 En los peores casos, el capital se agota cerca del año {first_fail:.1f}.")
+                st.error(f"💀 Ruina temprana: {first_fail:.1f} años.")
             else:
                 st.success("🎉 Plan Sostenible en todas las simulaciones.")
