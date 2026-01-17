@@ -1,15 +1,13 @@
-# NOMBRE DEL ARCHIVO: simulador.py
 import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import re
 
 # --- FUNCIÓN PRINCIPAL ---
 def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default_tc=930, default_ret_rf=6.0, default_ret_rv=10.0, default_inmo_neto=0):
     
-    # --- 1. CONFIGURACIÓN ---
     if 'current_results' not in st.session_state: st.session_state.current_results = None
     
     SCENARIOS = {
@@ -19,6 +17,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         "Mis Datos 🏠": {"rf": default_ret_rf, "rv": default_ret_rv, "inf": 3.5, "vol": 18.0, "crisis": 5}
     }
 
+    # Inicializar inputs
     if "in_inf" not in st.session_state: st.session_state.in_inf = 3.0
     if "in_rf" not in st.session_state: st.session_state.in_rf = default_ret_rf
     if "in_rv" not in st.session_state: st.session_state.in_rv = default_ret_rv
@@ -35,7 +34,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             st.session_state.in_vol = vals["vol"]
             st.session_state.in_cris = vals["crisis"]
 
-    # --- 2. MOTOR MATEMÁTICO ---
+    # --- MOTOR MATEMÁTICO ---
     @dataclass
     class AssetBucket:
         name: str; weight: float = 0.0; mu_nominal: float = 0.0; sigma_nominal: float = 0.0; is_bond: bool = False
@@ -63,7 +62,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             n_sims, n_steps, n_assets = self.cfg.n_sims, self.total_steps, len(self.assets)
             capital_paths = np.zeros((n_sims, n_steps + 1)); capital_paths[:, 0] = self.cfg.initial_capital
             cpi_paths = np.ones((n_sims, n_steps + 1))
-            ruin_indices = np.full(n_sims, -1) # -1 significa que no quebró
+            ruin_indices = np.full(n_sims, -1)
             
             asset_values = np.zeros((n_sims, n_assets))
             for i, a in enumerate(self.assets): asset_values[:, i] = self.cfg.initial_capital * a.weight
@@ -95,24 +94,23 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                     step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
                 
                 asset_values *= np.exp(step_rets)
-                
                 total_cap = np.sum(asset_values, axis=1)
+                
+                # Guardrails
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
-                
                 year = t / 12
-                wd_base_start = 0
+                wd_base = 0
                 for w in self.withdrawals:
-                    if w.from_year <= year < w.to_year:
-                        wd_base_start = w.amount_nominal_monthly_start; break
+                    if w.from_year <= year < w.to_year: wd_base = w.amount_nominal_monthly_start; break
                 
                 if self.cfg.use_guardrails:
                     drawdown = (max_real_wealth - current_real_wealth) / max_real_wealth
                     in_trouble = drawdown > self.cfg.guardrail_trigger
                     wd_nom = np.zeros(n_sims)
-                    wd_nom[~in_trouble] = wd_base_start * cpi_paths[~in_trouble, t]
-                    wd_nom[in_trouble] = (wd_base_start * cpi_paths[in_trouble, t]) * (1.0 - self.cfg.guardrail_cut)
-                else: wd_nom = np.full(n_sims, wd_base_start) * cpi_paths[:, t]
+                    wd_nom[~in_trouble] = wd_base * cpi_paths[~in_trouble, t]
+                    wd_nom[in_trouble] = (wd_base * cpi_paths[in_trouble, t]) * (1.0 - self.cfg.guardrail_cut)
+                else: wd_nom = np.full(n_sims, wd_base) * cpi_paths[:, t]
 
                 ratio = np.divide(wd_nom, total_cap, out=np.zeros_like(total_cap), where=total_cap!=0)
                 ratio = np.clip(ratio, 0, 1)
@@ -121,8 +119,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 # Check Ruina
                 prev_cap = capital_paths[:, t-1]
                 curr_cap = np.sum(asset_values, axis=1)
-                # Si estaba vivo y ahora es 0 o menos
-                just_died = (prev_cap > 0) & (curr_cap <= 1000) # Umbral bajo
+                just_died = (prev_cap > 0) & (curr_cap <= 1000)
                 ruin_indices[just_died] = t
                 asset_values[curr_cap <= 1000] = 0
                 
@@ -132,7 +129,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                     if np.any(alive):
                         for i, asset in enumerate(self.assets):
                             asset_values[alive, i] = tot[alive] * asset.weight
-                
                 capital_paths[:, t] = np.sum(asset_values, axis=1)
                 
             return capital_paths, cpi_paths, ruin_indices
@@ -142,7 +138,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         return int(re.sub(r'\D', '', v)) if v else 0
     def fmt(v): return f"{int(v):,}".replace(",", ".")
 
-    # --- 4. INTERFAZ ---
+    # --- INTERFAZ ---
     st.markdown("""
     <style>
         div.stButton > button[kind="primary"] {
@@ -157,7 +153,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     with st.sidebar:
         st.header("1. Escenario")
         st.selectbox("Preset:", list(SCENARIOS.keys()), key="scenario_selector", index=1, on_change=update_params_callback)
-        
         with st.expander("Variables", expanded=True):
             p_inf = st.number_input("Inflación (%)", key="in_inf", step=0.1)
             p_rf = st.number_input("Retorno RF (%)", key="in_rf", step=0.1)
@@ -171,21 +166,19 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         if sell_prop:
             net_inmo_val = st.number_input("Valor Neto a Invertir ($)", value=int(default_inmo_neto))
             rent_cost = st.number_input("Nuevo Costo Arriendo ($/mes)", value=1500000, step=100000)
-            st.info(f"Se sumarán ${fmt(net_inmo_val)} al capital y se restarán ${fmt(rent_cost)} al flujo mensual.")
+            st.info(f"Se sumarán ${fmt(net_inmo_val)} al capital y se restarán ${fmt(rent_cost)} al flujo.")
         else:
-            st.caption("Mantienes la propiedad. No se suma al capital líquido.")
-            net_inmo_val = 0
-            rent_cost = 0
+            st.caption("Mantienes propiedad. No suma al capital.")
+            net_inmo_val, rent_cost = 0, 0
 
         st.divider()
         st.markdown("### 🧠 Seguridad")
         use_guard = st.checkbox("🛡️ Guardrails", value=True)
         if use_guard:
             c1, c2 = st.columns(2)
-            gr_trigger = c1.number_input("Trigger %", 15, 50, 20)
+            gr_trigger = c1.number_input("Trigger %", 10, 50, 15)
             gr_cut = c2.number_input("Cut %", 5, 50, 10)
-        else: gr_trigger, gr_cut = 20, 10
-        
+        else: gr_trigger, gr_cut = 15, 10
         n_sims = st.slider("Sims", 500, 5000, 1000)
         horiz = st.slider("Horizonte", 10, 60, 40)
 
@@ -194,13 +187,10 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
     ini_def = default_rf + default_mx + default_rv + (default_usd_nominal * default_tc)
     if ini_def == 0: ini_def = 1800000000
     
-    # Ajuste por venta inmobiliaria
-    final_capital = ini_def + net_inmo_val
-    
     c1, c2, c3 = st.columns(3)
     with c1: 
         cap_input = clean("Capital Líquido ($)", ini_def, "cap")
-        if sell_prop: st.success(f"Total con Venta: ${fmt(cap_input + net_inmo_val)}")
+        if sell_prop: st.success(f"Total Inv: ${fmt(cap_input + net_inmo_val)}")
     with c2: pct_rv = st.slider("% Renta Variable", 0, 100, 60)
     with c3: 
         st.metric("Mix", f"{100-pct_rv}% RF / {pct_rv}% RV")
@@ -208,12 +198,11 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
     st.markdown("### 💸 Plan de Retiro (Nominal)")
     g1, g2, g3 = st.columns(3)
-    # Sumamos el costo de arriendo si vendió
     with g1: r1 = clean("Fase 1 ($)", 6000000, "r1") + rent_cost; d1 = st.number_input("Años", 7)
     with g2: r2 = clean("Fase 2 ($)", 5500000, "r2") + rent_cost; d2 = st.number_input("Años", 13)
     with g3: r3 = clean("Fase 3 ($)", 5000000, "r3") + rent_cost; st.caption("Resto vida")
     
-    if sell_prop: st.warning(f"⚠️ Nota: Los retiros incluyen ${fmt(rent_cost)} de arriendo adicional.")
+    if sell_prop: st.warning(f"⚠️ Nota: Los retiros ahora incluyen ${fmt(rent_cost)} de arriendo.")
 
     if st.button("🚀 EJECUTAR ANÁLISIS PRO", type="primary"):
         assets = [
@@ -240,20 +229,16 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             success = np.mean(final_nom > 0) * 100
             median_legacy = np.median(final_nom / cpi[:, -1])
             
-            # Análisis Ruina (Año 80%)
+            # --- CÁLCULO DE RUINA PRECISA (TU PETICIÓN) ---
             fails = ruin_idx[ruin_idx > -1]
             if len(fails) > 0:
-                ruin_years = fails / 12
-                # Percentil 20 (donde empieza el 80% de los casos más tardíos) o Percentil 10?
-                # "Comienza el 80%": Si ordenamos de más temprana a más tardía.
-                # Queremos ignorar el 20% más temprano (mala suerte extrema).
-                start_80_pct = np.percentile(ruin_years, 20)
+                fail_years = fails / 12
+                # Ignoramos el 20% de ruinas más tempranas (mala suerte extrema)
+                # Reportamos dónde empieza el "grueso" de los problemas (el 80% restante)
+                start_80_pct = np.percentile(fail_years, 20)
             else: start_80_pct = 0
             
-            st.session_state.current_results = {
-                "succ": success, "leg": median_legacy, "paths": paths, 
-                "ruin_start": start_80_pct, "n_fails": len(fails)
-            }
+            st.session_state.current_results = {"succ": success, "leg": median_legacy, "paths": paths, "ruin_start": start_80_pct, "n_fails": len(fails)}
 
     if st.session_state.current_results:
         res = st.session_state.current_results
@@ -267,9 +252,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         """, unsafe_allow_html=True)
         
         c1, c2 = st.columns(2)
-        c1.metric("Probabilidad de Ruina", f"{100-res['succ']:.1f}%")
+        c1.metric("Probabilidad de Ruina", f"{100-res['succ']:.1f}%", help="Porcentaje de escenarios donde el dinero se acaba.")
         val_ruin = f"Año {res['ruin_start']:.1f}" if res['n_fails'] > 0 else "Nunca"
-        c2.metric("Inicio Zona de Ruina (80%)", val_ruin, help="El 80% de las quiebras ocurren después de este año. (Filtra la mala suerte temprana).")
+        c2.metric("Inicio Zona de Ruina (80%)", val_ruin, help="El 80% de las quiebras ocurren después de este año. (Descarta el 20% de peor suerte inicial).")
 
         y = np.arange(res["paths"].shape[1])/12
         p10, p50, p90 = np.percentile(res["paths"], 10, axis=0), np.percentile(res["paths"], 50, axis=0), np.percentile(res["paths"], 90, axis=0)
