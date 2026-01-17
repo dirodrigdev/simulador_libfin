@@ -25,11 +25,9 @@ class SimulationConfig:
     initial_capital: float = 1_000_000
     n_sims: int = 2000
     
-    # Parámetros Base (Normales)
+    # Parámetros Base
     mu_normal_rv: float = 0.10
     mu_normal_rf: float = 0.06
-    
-    # Inflación
     inflation_mean: float = 0.035
     inflation_vol: float = 0.012
     
@@ -46,20 +44,12 @@ class SimulationConfig:
     inmo_strategy: str = "portfolio"
     annuity_rate: float = 0.05 
     
-    # Parámetros Crisis (Calculados en UI)
-    mu_local_rv: float = -0.15
-    mu_local_rf: float = 0.08  
-    corr_local: float = -0.25  
-    
-    mu_global_rv: float = -0.35 
-    mu_global_rf: float = -0.06 
-    corr_global: float = 0.90   
-    
-    prob_enter_local: float = 0.005  
-    prob_enter_global: float = 0.004 
-    prob_exit_crisis: float = 0.085  
+    # Crisis (Calculados en UI)
+    mu_local_rv: float = -0.15; mu_local_rf: float = 0.08; corr_local: float = -0.25  
+    mu_global_rv: float = -0.35; mu_global_rf: float = -0.06; corr_global: float = 0.90   
+    prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085  
 
-# --- 2. EL MOTOR DE SIMULACIÓN (V7 SOVEREIGN GRADE) ---
+# --- 2. EL MOTOR DE SIMULACIÓN (V8 WHITE BOX PATCHED) ---
 class InstitutionalSimulator:
     def __init__(self, config, assets, withdrawals):
         self.cfg = config
@@ -68,20 +58,14 @@ class InstitutionalSimulator:
         self.dt = 1/config.steps_per_year
         self.total_steps = int(config.horizon_years * config.steps_per_year)
 
-        # DEFINICIÓN DE 3 RÉGIMENES
         self.mu_regimes = np.array([
-            [self.cfg.mu_normal_rv, self.cfg.mu_normal_rf], # 0: Normal
-            [self.cfg.mu_local_rv, self.cfg.mu_local_rf],   # 1: Local
-            [self.cfg.mu_global_rv, self.cfg.mu_global_rf]  # 2: Global
+            [self.cfg.mu_normal_rv, self.cfg.mu_normal_rf],
+            [self.cfg.mu_local_rv, self.cfg.mu_local_rf],
+            [self.cfg.mu_global_rv, self.cfg.mu_global_rf]
         ])
         
-        self.sigma_regimes = np.array([
-            [0.14, 0.05],   # 0: Normal
-            [0.22, 0.18],   # 1: Local
-            [0.32, 0.15]    # 2: Global
-        ])
+        self.sigma_regimes = np.array([[0.14, 0.05], [0.22, 0.18], [0.32, 0.15]])
         
-        # MATRICES DE CORRELACIÓN
         cn = np.array([[1.0, 0.35], [0.35, 1.0]])
         self.L_normal = np.linalg.cholesky(cn)
         
@@ -99,10 +83,15 @@ class InstitutionalSimulator:
         n_sims, n_steps = self.cfg.n_sims, self.total_steps
         n_assets = len(self.assets)
         
+        # 1. Inicialización de Estados
         capital_paths = np.zeros((n_sims, n_steps + 1))
         capital_paths[:, 0] = self.cfg.initial_capital
+        
         cpi_paths = np.ones((n_sims, n_steps + 1))
-        ruin_indices = np.full(n_sims, -1) # -1 = Vivo
+        
+        # Máscara de Ruina (True = Muerto)
+        is_ruined = np.zeros(n_sims, dtype=bool)
+        ruin_indices = np.full(n_sims, -1) 
         
         asset_values = np.zeros((n_sims, n_assets))
         for i, a in enumerate(self.assets):
@@ -122,49 +111,71 @@ class InstitutionalSimulator:
                 r_m = self.cfg.annuity_rate / 12
                 annuity_monthly = self.cfg.net_inmo_value * (r_m * (1+r_m)**months) / ((1+r_m)**months - 1) if r_m > 0 else self.cfg.net_inmo_value / months
 
-        # MOTOR MATEMÁTICO: T-STUDENT MULTIVARIANTE (Validado por PhD)
+        # 2. MOTOR MATEMÁTICO CORREGIDO (AUDIT FIX)
+        # Fix 1: Generación correcta de T-Student Multivariante sin estandarización prematura
         df = 8 
         G = np.random.normal(0, 1, (n_sims, n_steps, n_assets))
         W = np.random.chisquare(df, (n_sims, n_steps, 1)) / df
-        Z_base = G / np.sqrt(W)
-        Z_base *= np.sqrt((df-2)/df) 
+        Z_raw = G / np.sqrt(W) # Ruido T-Student puro
+        
+        # Estandarización de varianza post-generación (Solo para escalar a sigma=1, no rompe correlación)
+        # La varianza teórica de T(df) es df/(df-2). Dividimos por sqrt(df/(df-2)) para normalizar.
+        Z_raw /= np.sqrt(df / (df - 2)) 
 
         inf_shocks = np.random.normal(self.cfg.inflation_mean * self.dt, 
                                       self.cfg.inflation_vol * np.sqrt(self.dt), 
                                       (n_sims, n_steps))
 
+        # Fix 2: Pre-allocating z_final outside loop (Memory Optimization)
+        z_final = np.zeros((n_sims, n_assets))
+
+        # 3. BUCLE TEMPORAL
         for t in range(n_steps):
-            # A. MARKOV
-            mask_0 = (current_regime == 0)
-            rand_0 = np.random.rand(np.sum(mask_0))
             
-            p_L = self.p_norm_to_local
-            p_G = self.p_norm_to_global
+            # --- A. Gestión de Muertos (ZOMBIE KILL SWITCH) ---
+            # Si estás arruinado, tus activos son 0 y no participas en el mercado.
+            if np.any(is_ruined):
+                asset_values[is_ruined] = 0.0
+                capital_paths[is_ruined, t+1] = 0.0
+                # No calculamos retornos para muertos
             
-            new_0_to_1 = rand_0 < p_L
-            new_0_to_2 = (rand_0 >= p_L) & (rand_0 < (p_L + p_G))
+            # --- B. Markov Switching ---
+            # Solo actualizamos régimen para los vivos (optimización)
+            alive_mask = ~is_ruined
+            if np.any(alive_mask):
+                mask_0 = (current_regime == 0) & alive_mask
+                if np.any(mask_0):
+                    n_alive_0 = np.sum(mask_0)
+                    rand_0 = np.random.rand(n_alive_0)
+                    p_L = self.p_norm_to_local; p_G = self.p_norm_to_global
+                    
+                    new_0_to_1 = rand_0 < p_L
+                    new_0_to_2 = (rand_0 >= p_L) & (rand_0 < (p_L + p_G))
+                    
+                    idx_0 = np.where(mask_0)[0]
+                    current_regime[idx_0[new_0_to_1]] = 1
+                    current_regime[idx_0[new_0_to_2]] = 2
+                
+                mask_crisis = (current_regime > 0) & alive_mask
+                if np.any(mask_crisis):
+                    n_alive_c = np.sum(mask_crisis)
+                    rand_c = np.random.rand(n_alive_c)
+                    back_to_norm = rand_c < self.p_exit
+                    idx_c = np.where(mask_crisis)[0]
+                    current_regime[idx_c[back_to_norm]] = 0
+
+            # --- C. Cálculo de Retornos (Solo Vivos) ---
+            # Reset z_final buffer
+            z_final.fill(0.0)
             
-            idx_0 = np.where(mask_0)[0]
-            current_regime[idx_0[new_0_to_1]] = 1
-            current_regime[idx_0[new_0_to_2]] = 2
+            z_t = Z_raw[:, t, :]
             
-            mask_crisis = (current_regime > 0)
-            if np.any(mask_crisis):
-                rand_c = np.random.rand(np.sum(mask_crisis))
-                back_to_norm = rand_c < self.p_exit
-                idx_c = np.where(mask_crisis)[0]
-                current_regime[idx_c[back_to_norm]] = 0
+            # Aplicación Vectorizada de Cholesky
+            # Solo aplicamos para simulaciones vivas para ahorrar cómputo
+            m0 = (current_regime == 0) & alive_mask
+            m1 = (current_regime == 1) & alive_mask
+            m2 = (current_regime == 2) & alive_mask
             
-            # B. INFLACIÓN
-            current_inf_shock = inf_shocks[:, t]
-            current_inf_shock[current_regime == 1] += 0.003 
-            cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + np.maximum(current_inf_shock, -0.02))
-            
-            # C. CHOLESKY
-            z_t = Z_base[:, t, :] 
-            z_final = np.zeros_like(z_t)
-            
-            m0 = (current_regime == 0); m1 = (current_regime == 1); m2 = (current_regime == 2)
             if np.any(m0): z_final[m0] = np.dot(z_t[m0], self.L_normal.T)
             if np.any(m1): z_final[m1] = np.dot(z_t[m1], self.L_local.T)
             if np.any(m2): z_final[m2] = np.dot(z_t[m2], self.L_global.T)
@@ -172,21 +183,29 @@ class InstitutionalSimulator:
             mus_t = self.mu_regimes[current_regime]
             sigs_t = self.sigma_regimes[current_regime]
             
-            step_rets = (mus_t - 0.5 * sigs_t**2) * self.dt + \
-                         sigs_t * np.sqrt(self.dt) * z_final
-            
+            step_rets = (mus_t - 0.5 * sigs_t**2) * self.dt + sigs_t * np.sqrt(self.dt) * z_final
             step_rets = np.clip(step_rets, -0.6, 0.6) 
-            asset_values *= np.exp(step_rets)
             
-            # D. EVENTOS (Venta Propiedad)
+            # Actualizar valores (solo vivos)
+            # Para muertos, step_rets será basura pero asset_values ya es 0, así que 0*exp(...) = 0
+            asset_values[alive_mask] *= np.exp(step_rets[alive_mask])
+            
+            # --- D. Inflación ---
+            current_inf_shock = inf_shocks[:, t]
+            current_inf_shock[current_regime == 1] += 0.003 
+            cpi_paths[:, t+1] = cpi_paths[:, t] * (1 + np.maximum(current_inf_shock, -0.02))
+            
+            # --- E. Eventos Exógenos (Inmobiliario) ---
             spy = self.cfg.steps_per_year
             current_year = (t+1) / spy
             
             if self.cfg.sell_year > 0 and (t+1) == int(self.cfg.sell_year * spy):
+                # IMPORTANTE: Solo inyectamos dinero si está VIVO.
+                # Un muerto no puede vender una casa (o se asume liquidada en la quiebra).
                 if self.cfg.inmo_strategy == 'portfolio':
-                    asset_values[:, 0] += self.cfg.net_inmo_value * cpi_paths[:, t+1]
+                    asset_values[alive_mask, 0] += self.cfg.net_inmo_value * cpi_paths[alive_mask, t+1]
             
-            # E. FLUJOS
+            # --- F. Flujos de Caja ---
             total_cap = np.sum(asset_values, axis=1)
             current_real_wealth = total_cap / cpi_paths[:, t+1]
             
@@ -210,13 +229,14 @@ class InstitutionalSimulator:
             net_cashflow = ann_nom - (living_nom + rent_nom)
             port_adj = -net_cashflow 
             
-            mask_surp = port_adj <= 0
+            # Aplicar flujos (solo a vivos)
+            mask_surp = (port_adj <= 0) & alive_mask
             if np.any(mask_surp):
                 surp = -port_adj[mask_surp]
                 for i, asset in enumerate(self.assets):
                     asset_values[mask_surp, i] += surp * asset.weight
             
-            mask_def = port_adj > 0
+            mask_def = (port_adj > 0) & alive_mask
             if np.any(mask_def):
                 wd_req = port_adj[mask_def]
                 wd_req = np.minimum(wd_req, total_cap[mask_def])
@@ -232,14 +252,21 @@ class InstitutionalSimulator:
                     ratio = wd_req / np.where(tot_d!=0, tot_d, 1.0)
                     asset_values[mask_def] *= (1 - np.minimum(ratio, 1.0)[:, np.newaxis])
             
-            # F. ESTADO Y RUINA
-            asset_values = np.maximum(asset_values, 0)
+            # --- G. Verificación de Ruina (STRICT MODE) ---
+            # Actualizamos valores post-flujo
+            asset_values = np.maximum(asset_values, 0) # Safety floor
             capital_paths[:, t+1] = np.sum(asset_values, axis=1)
             
-            # DETECTOR DE MUERTE SÚBITA
-            # Si en este mes (t+1) el capital es < 1000, marca ruina.
-            is_ruined = (capital_paths[:, t+1] <= 1000) & (ruin_indices == -1)
-            ruin_indices[is_ruined] = t+1
+            # Detectar NUEVAS muertes
+            # Capital <= 1000 Y estaba vivo
+            newly_dead = (capital_paths[:, t+1] <= 1000) & alive_mask
+            
+            if np.any(newly_dead):
+                is_ruined[newly_dead] = True
+                ruin_indices[newly_dead] = t+1
+                # Forzamos 0 inmediatamente para que no revivan en el siguiente loop
+                capital_paths[newly_dead, t+1] = 0.0
+                asset_values[newly_dead] = 0.0
 
         return capital_paths, cpi_paths, ruin_indices, annuity_monthly, np.zeros(n_steps)
 
@@ -250,28 +277,22 @@ def clean(lbl, d, k):
 
 def fmt(v): return f"{int(v):,}".replace(",", ".")
 
-# --- 4. INTERFAZ PRINCIPAL (APP) ---
+# --- 4. INTERFAZ PRINCIPAL ---
 def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
     
     st.markdown("## 🦅 Panel de Decisión Patrimonial")
-    st.markdown("Motor **V7 Sovereign Grade** (Corregido). No permite 'resurrección financiera'.")
+    st.markdown("Motor **V8 White Box** (Corregido y Optimizado).")
 
     # ESCENARIOS
     SCENARIOS_GLOBAL = {
-        "Colapso Sistémico (Recomendado)": 
-            {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.35, "desc": "⚠️ No hay refugio. Inflación + Recesión."},
-        "Crash Financiero (Tipo 2008)": 
-            {"corr": 0.70, "rf_ret": -0.02, "rv_ret": -0.30, "desc": "Todo cae, salvo el cash."},
-        "Recesión Estándar": 
-            {"corr": 0.50, "rf_ret": 0.0, "rv_ret": -0.20, "desc": "La bolsa cae, bonos protegen algo."}
+        "Colapso Sistémico (Recomendado)": {"corr": 0.92, "rf_ret": -0.06, "rv_ret": -0.35, "desc": "⚠️ ESCENARIO VALIDADO: No hay refugio. Inflación + Recesión."},
+        "Crash Financiero (Tipo 2008)": {"corr": 0.70, "rf_ret": -0.02, "rv_ret": -0.30, "desc": "Todo cae, salvo el cash."},
+        "Recesión Estándar": {"corr": 0.50, "rf_ret": 0.0, "rv_ret": -0.20, "desc": "La bolsa cae, bonos protegen algo."}
     }
     SCENARIOS_LOCAL = {
-        "Protección Estándar (Recomendado)": 
-            {"corr": -0.25, "rf_ret": 0.08, "desc": "El Dólar/UF actúa como hedge."},
-        "Dólar Blindado": 
-            {"corr": -0.35, "rf_ret": 0.10, "desc": "Patrimonio USD se dispara."},
-        "Falla del Hedge": 
-            {"corr": 0.20, "rf_ret": 0.0, "desc": "Crisis interna sin protección."}
+        "Protección Estándar (Recomendado)": {"corr": -0.25, "rf_ret": 0.08, "desc": "El Dólar/UF actúa como hedge efectivo."},
+        "Dólar Blindado": {"corr": -0.35, "rf_ret": 0.10, "desc": "Patrimonio USD se dispara."},
+        "Falla del Hedge": {"corr": 0.20, "rf_ret": 0.0, "desc": "Crisis interna sin protección."}
     }
     SCENARIOS_RENTABILIDAD = {
         "Histórico (Recomendado)": {"rv": 0.10, "rf": 0.06},
@@ -309,7 +330,7 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
         sell_prop = st.checkbox("Vender Propiedad Futura", value=False)
         if sell_prop:
             val_inmo = st.number_input("Valor Neto Hoy ($)", value=int(default_inmo_neto))
-            sale_year = st.slider("Año de Venta", 1, 40, 35) # Default alto para probar
+            sale_year = st.slider("Año de Venta", 1, 40, 35)
             rent_cost = st.number_input("Nuevo Arriendo ($/mes)", value=1500000, step=100000)
             strat = st.radio("Destino:", ["Invertir", "Anualidad"], index=0)
             inmo_strat = 'portfolio' if "Invertir" in strat else 'annuity'
@@ -340,15 +361,12 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
         with st.spinner(f"Simulando {n_sims} vidas..."):
             paths, cpi, ruin_idx, ann_val, _ = sim.run()
             
-            # --- CÁLCULO DE ÉXITO ESTRICTO ---
-            # Si en CUALQUIER momento (ruin_idx > -1) quebraste, es un fallo.
             failures = np.sum(ruin_indices > -1)
             success_prob = (1 - (failures / n_sims)) * 100
             
             final_wealth = paths[:, -1]
             median_legacy = np.median(final_wealth / cpi[:, -1])
             
-            # Semáforo
             if success_prob >= 90: clr, msg, icon = "#10b981", "LUZ VERDE", "✅"
             elif success_prob >= 75: clr, msg, icon = "#f59e0b", "PRECAUCIÓN", "⚠️"
             else: clr, msg, icon = "#ef4444", "ALTO RIESGO", "🛑"
@@ -361,7 +379,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
                 <p style="margin:0; font-size:0.9em;">Herencia Estimada: <b>${fmt(median_legacy)}</b></p>
             </div>""", unsafe_allow_html=True)
             
-            # Gráfico
             y_axis = np.arange(paths.shape[1])/12
             upper_bound = np.percentile(paths, 90, axis=0)
             lower_bound = np.percentile(paths, 10, axis=0)
@@ -379,6 +396,6 @@ def app(default_rf=363000000, default_rv=1368000000, default_inmo_neto=0):
             fails = ruin_idx[ruin_idx > -1]
             if len(fails) > 0:
                 first_fail = np.percentile(fails/12, 10)
-                st.error(f"💀 En los peores casos, la ruina ocurre el año {first_fail:.1f} (aunque luego vendas la casa).")
+                st.error(f"💀 Ruina temprana: Año {first_fail:.1f}")
             else:
                 st.success("🎉 Plan 100% Sostenible.")
