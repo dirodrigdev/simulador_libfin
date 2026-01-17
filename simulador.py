@@ -72,7 +72,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             try: L = np.linalg.cholesky(self.corr_matrix)
             except: L = np.eye(n_assets)
 
-            # ÍNDICES DINÁMICOS
+            # --- INDICES DINÁMICOS ---
             try: rv_idx = next(i for i, a in enumerate(self.assets) if not a.is_bond)
             except StopIteration: rv_idx = 0
             try: rf_idx = next(i for i, a in enumerate(self.assets) if a.is_bond)
@@ -95,7 +95,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                         annuity_monthly_payout_real = self.cfg.net_inmo_value * (r_monthly * factor) / (factor - 1)
                     else: annuity_monthly_payout_real = self.cfg.net_inmo_value / months
 
-            # INICIALIZACIÓN FUERA DEL LOOP (CORRECCIÓN CRÍTICA)
+            # VARIABLE CRÍTICA INICIALIZADA FUERA DEL LOOP
             max_real_wealth = np.full(n_sims, self.cfg.initial_capital)
 
             for t in range(1, n_steps + 1):
@@ -110,7 +110,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                     in_crisis = np.logical_or(in_crisis, new_c)
                     in_crisis[np.random.rand(n_sims) < 0.15] = False
 
-                # 3. Retornos (Browniano Estándar - Sin Inestabilidad)
+                # 3. Retornos (Browniano Estándar)
                 if self.cfg.use_fat_tails:
                     df = 5; std_adj = np.sqrt((df-2)/df)
                     z_uncorr = np.random.standard_t(df, (n_sims, n_assets)) * std_adj
@@ -123,7 +123,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                     if p_crisis > 0 and np.any(in_crisis): 
                         mu *= self.cfg.crisis_drift 
                         if not self.cfg.use_fat_tails: sig *= self.cfg.crisis_vol
-                    # Retorno estándar para estabilidad
                     step_rets[:, i] = (mu - 0.5 * sig**2) * self.dt + sig * np.sqrt(self.dt) * z_corr[:, i]
 
                 asset_values *= np.exp(step_rets)
@@ -145,7 +144,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
 
                 total_cap = np.sum(asset_values, axis=1)
                 
-                # Actualización de riqueza real DENTRO del loop
+                # Actualizar Max Wealth DENTRO del loop
                 current_real_wealth = total_cap / cpi_paths[:, t]
                 max_real_wealth = np.maximum(max_real_wealth, current_real_wealth)
 
@@ -157,7 +156,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
                 
                 living_nom = np.zeros(n_sims)
                 if self.cfg.use_guardrails:
-                    # Protección div/0
                     denom = np.maximum(max_real_wealth, 1.0)
                     dd_port = (max_real_wealth - current_real_wealth) / denom
                     in_trouble_g = dd_port > self.cfg.guardrail_trigger
@@ -272,7 +270,6 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
         use_smart = st.checkbox("🥛 Smart Buckets", value=True, help="Prioriza sacar de RF.")
         use_guard = st.checkbox("🛡️ Guardrails", value=True)
         use_fat = st.checkbox("📉 Fat Tails", value=True)
-        # Eliminado Bonos Reales para evitar inestabilidad
         
         if use_guard:
             c1, c2 = st.columns(2)
@@ -327,7 +324,7 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             horizon_years=horiz, initial_capital=cap_input, n_sims=n_sims, 
             inflation_mean=p_inf/100, prob_crisis=p_cris/100,
             use_guardrails=use_guard, guardrail_trigger=gr_trigger/100.0, guardrail_cut=gr_cut/100.0,
-            use_fat_tails=use_fat, use_mean_reversion=False, # Desactivado por seguridad
+            use_fat_tails=use_fat, use_mean_reversion=False, 
             use_smart_buckets=use_smart,
             sell_year=sale_year, net_inmo_value=net_inmo_val, new_rent_cost=rent_cost,
             inmo_strategy=inmo_strat_code, annuity_rate=annuity_rate_ui/100.0
@@ -372,8 +369,9 @@ def app(default_rf=0, default_mx=0, default_rv=0, default_usd_nominal=0, default
             c3.metric("Flujo Inmobiliario Neto", f"${fmt(delta_cash)}/mes", delta="Superávit" if delta_cash > 0 else "Déficit")
 
         y = np.arange(res["paths"].shape[1])/12
-        # Limpieza de visualización para evitar que valores infinitos rompan el gráfico
-        paths_clean = np.clip(res["paths"], 0, np.percentile(res["paths"][:,-1], 95) * 1.5)
+        
+        # VISUALIZACIÓN SEGURA (Clip)
+        paths_clean = np.clip(res["paths"], 0, np.percentile(res["paths"][:,-1], 95) * 2.0)
         
         p10 = np.percentile(paths_clean, 10, axis=0)
         p50 = np.percentile(paths_clean, 50, axis=0)
