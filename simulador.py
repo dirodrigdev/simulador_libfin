@@ -1275,6 +1275,7 @@ def app(
         st.caption("Esto no reemplaza el Monte Carlo: te muestra el 'camino esperado' y qué variables te mueven más el éxito.")
 
         sims_diag = st.slider("Sims por punto (tornado)", 100, 800, 300, step=50, key="sims_diag")
+        target_diag = st.slider("Meta de éxito (para plan de acción)", 70, 100, 95, step=1, key="target_diag")
         run_diag = st.button("🩻 Ejecutar diagnóstico", key="run_diag")
 
         if run_diag:
@@ -1326,6 +1327,164 @@ def app(
                 st.plotly_chart(fig_t, use_container_width=True)
 
                 st.caption("Interpretación: si 'Inflación media' te pega más que 'Retorno RV', tu problema no es 'más acciones': es cobertura de inflación y gasto.")
+
+                # --- Cuadro de interpretación y acciones ---
+                st.markdown("---")
+                st.subheader("Interpretación y acciones")
+                st.caption("Lo de arriba te dice 'qué duele'. Esto te dice 'qué puedes hacer' (y qué no).")
+
+                meaning = {
+                    "Retorno RV (mu)": "El 'motor' esperado. Si rinde menos, tu plan se achica. No es palanca directa: es incertidumbre de mercado.",
+                    "Inflacion media": "El impuesto invisible. Si la inflación sube, tu gasto real sube y el capital real cae.",
+                    "Gasto (todos tramos)": "Tu tasa de extracción. Esta sí es palanca directa (y suele ser la #1).",
+                    "Prob crisis global": "Frecuencia de años feos globales (caen casi todos juntos). No se controla: se mitiga.",
+                    "Prob crisis local": "Frecuencia de crisis 'Chile'. No se controla: se mitiga con UF, reserva y diversificación.",
+                    "Retorno RF (mu)": "Rendimiento de tu defensa. Más bajo = menos colchón. Parcialmente mitigable con instrumentos/UF/duración.",
+                }
+
+                interp_rows = []
+                for r in rows:
+                    d_bad = r["bad"] - base_p
+                    d_good = r["good"] - base_p
+                    imp = float(r["impact_abs"])
+                    if imp >= 8:
+                        lvl = "Alta"
+                    elif imp >= 4:
+                        lvl = "Media"
+                    else:
+                        lvl = "Baja"
+                    interp_rows.append({
+                        "Factor": r["driver"],
+                        "Importancia": lvl,
+                        "Δ peor (pp)": round(d_bad, 1),
+                        "Δ mejor (pp)": round(d_good, 1),
+                        "Qué significa": meaning.get(r["driver"], "—"),
+                    })
+
+                df_interp = pd.DataFrame(interp_rows)
+                st.markdown("### 🧠 Cuadro de interpretación")
+                st.dataframe(df_interp, use_container_width=True, hide_index=True)
+
+                # --- Acciones (palancas reales) ---
+                st.markdown("### 🛠️ Cuadro de acción (lo que sí puedes tocar)")
+                st.caption("Las cifras de 'impacto' son aproximadas: vienen del tornado (cambio 1 a la vez). Úsalo como brújula, no como GPS.")
+
+                def _find(driver_name: str):
+                    return next((rr for rr in rows if rr.get("driver") == driver_name), None)
+
+                actions = []
+                def _add(palanca: str, donde: str, efecto: str, para_que: str, tradeoff: str):
+                    actions.append({
+                        "Palanca": palanca,
+                        "Dónde se toca": donde,
+                        "Efecto estimado": efecto,
+                        "Para qué sirve": para_que,
+                        "Trade-off": tradeoff,
+                    })
+
+                # 1) Gasto (siempre accionable)
+                r_sp = _find("Gasto (todos tramos)")
+                eff_sp = (r_sp["good"] - base_p) if r_sp else None  # good = -10%
+                rec_txt = "—"
+                if eff_sp is not None and eff_sp > 0 and target_diag > base_p:
+                    need = float(target_diag - base_p)
+                    cut_pct = min(40.0, (need / eff_sp) * 10.0)
+                    rec_txt = f"-10% gasto ≈ {eff_sp:+.1f} pp | para llegar a {target_diag:.0f}%: ~{cut_pct:.0f}% (estimación)"
+                elif eff_sp is not None:
+                    rec_txt = f"-10% gasto ≈ {eff_sp:+.1f} pp"
+
+                _add(
+                    "Ajustar gasto",
+                    "Tramos de retiro (F1/F2/F3)",
+                    rec_txt,
+                    "Subir % éxito y reducir riesgo de 'secuencia de retornos'.",
+                    "Más éxito = menos vida social (o más disciplina).",
+                )
+
+                # 2) Reserva RF pura + risk-off de balanceados (solo modo cartera)
+                if use_portfolio:
+                    sims_actions = int(min(200, sims_diag))
+                    base_cfg_fast = replace(cfg_current, n_sims=sims_actions, random_seed=777)
+                    try:
+                        p0_fast = _run_success(
+                            base_cfg_fast,
+                            wds_current,
+                            True,
+                            rv_weight=float(rv_pct)/100.0,
+                            positions=positions,
+                            rules=rules,
+                        )
+                    except Exception:
+                        p0_fast = base_p
+
+                    # RF reserve years
+                    try:
+                        r_plus = replace(rules, rf_reserve_years=float(min(6.0, rules.rf_reserve_years + 0.5)))
+                        p_plus = _run_success(base_cfg_fast, wds_current, True, rv_weight=float(rv_pct)/100.0, positions=positions, rules=r_plus)
+                        eff = p_plus - p0_fast
+                        eff_txt = f"+0.5 años RF ≈ {eff:+.1f} pp"
+                    except Exception:
+                        eff_txt = "(no calculado)"
+
+                    _add(
+                        "Aumentar reserva RF pura",
+                        "Reglas cartera: 'Reserva RF (años)'",
+                        eff_txt,
+                        "Comprar tiempo en crisis sin tocar RV a mal precio.",
+                        "Más RF = menos crecimiento (pero más sueño).",
+                    )
+
+                    # Manager risk-off in crisis
+                    try:
+                        r_plus = replace(rules, manager_riskoff_in_crisis=float(min(1.0, rules.manager_riskoff_in_crisis + 0.25)))
+                        p_plus = _run_success(base_cfg_fast, wds_current, True, rv_weight=float(rv_pct)/100.0, positions=positions, rules=r_plus)
+                        eff = p_plus - p0_fast
+                        eff_txt = f"+0.25 risk-off ≈ {eff:+.1f} pp"
+                    except Exception:
+                        eff_txt = "(no calculado)"
+
+                    _add(
+                        "Volver balanceados más defensivos en crisis",
+                        "Reglas cartera: 'Risk-off en crisis'",
+                        eff_txt,
+                        "Reducir drawdowns cuando el mercado se pone feo.",
+                        "Si el rebote es rápido, podrías capturar menos recuperación.",
+                    )
+
+                    # Rebalance only when normal (palanca de control)
+                    _add(
+                        "Rebalance solo fuera de crisis",
+                        "Reglas cartera: 'Rebalancear solo en Normal'",
+                        "No cambia el mundo, pero evita ventas forzadas en el peor momento.",
+                        "Evitar rotación destructiva cuando hay pánico.",
+                        "Puede tardar más en volver al mix objetivo.",
+                    )
+
+                else:
+                    _add(
+                        "Ajustar mix RV/RF",
+                        "Slider 'Mix RV/RF'",
+                        "Prueba 55/45, 60/40, 65/35 y mira sensibilidad.",
+                        "Equilibrar crecimiento vs drawdown.",
+                        "Más RV = más volatilidad (y viceversa).",
+                    )
+
+                # 3) Inflación y crisis (mitigación, no control)
+                r_inf = _find("Inflacion media")
+                eff_inf = (r_inf["bad"] - base_p) if r_inf else None  # bad = +1pp
+                inf_txt = f"+1pp inflación ≈ {eff_inf:+.1f} pp" if eff_inf is not None else "—"
+                _add(
+                    "Blindaje contra inflación",
+                    "Composición: más UF / ajustar gasto real",
+                    inf_txt,
+                    "Proteger poder de compra (especialmente en Chile).",
+                    "Más UF/defensa puede bajar crecimiento esperado.",
+                )
+
+                df_act = pd.DataFrame(actions)
+                st.dataframe(df_act, use_container_width=True, hide_index=True)
+
+                st.info("Si quieres, el siguiente paso es que el optimizador use estas palancas (gasto/mix/reserva) para buscar automáticamente el 'mínimo ajuste' que te lleva a tu meta.")
 
     with tab_sum:
         st.subheader("Resumen ejecutivo")
