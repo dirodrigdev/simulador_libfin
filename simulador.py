@@ -829,7 +829,7 @@ def _deterministic_portfolio(cfg: SimulationConfig, positions, rules: PortfolioR
                     gap -= take
 
         cap_path[t + 1] = float(vals.sum())
-        cpi_path[t + 1] = cpi
+        cpi_path[t + 1] = cpi_path[t + 1] = cpi
 
     return cap_path, cpi_path
 
@@ -905,6 +905,62 @@ def app(
     **_ignored_kwargs,
 ):
     st.markdown("## 🦅 Panel de Decisión Patrimonial")
+
+    # ------------------------------------------------------------------
+    # Streamlit reruns + tabs/toggles can cause parts of the function to be
+    # skipped on certain reruns. If later tabs reference variables that were
+    # only defined inside a conditional/tab block, you get UnboundLocalError.
+    # We therefore pre-initialize all cross-tab variables with safe defaults.
+    # ------------------------------------------------------------------
+
+    # Pre-initialize session keys that the UI reads/writes across reruns
+    _defaults = {
+        "extra_events": [],
+        "evt": "Entrada",   # valor por defecto para el selectbox Tipo
+        "evy": 5,           # Año por defecto
+        "eva": 0,           # Monto por defecto (clean_input usa key "eva")
+        "portfolio_json": st.session_state.get("portfolio_json", ""),
+        "use_portfolio": st.session_state.get("use_portfolio", False),
+    }
+    for _k, _v in _defaults.items():
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    # Valores base (antes de leer session_state)
+    tot_ini = int(default_rf) + int(default_rv)
+    pct_rv_ini = 60
+
+    def _ss_int(key: str, default: int) -> int:
+        """Best-effort int from session_state (handles '6.000.000' style strings)."""
+        try:
+            v = st.session_state.get(key, None)
+            if v is None:
+                return int(default)
+            if isinstance(v, (int, float)):
+                return int(v)
+            s = str(v)
+            s = re.sub(r"\D", "", s)
+            return int(s) if s else int(default)
+        except Exception:
+            return int(default)
+
+    # Cross-tab defaults
+    positions: List[InstrumentPosition] = []
+    rules = PortfolioRulesConfig()
+    portfolio_ready = False
+
+    cap_val = _ss_int("cap", tot_ini)
+    rv_sl = int(st.session_state.get("rv_sl", 60))
+    rv_pct = float(rv_sl)
+
+    # Spending defaults (kept in session_state by clean_input)
+    r1 = _ss_int("r1", 6000000)
+    r2 = _ss_int("r2", 4000000)
+    r3 = _ss_int("r3", 4000000)
+
+    # Property / housing defaults
+    enable_p = bool(st.session_state.get("enable_p", True))
+    val_h = _ss_int("vi", int(default_inmo_neto)) if enable_p else 0
     
     SC_RET = {"Conservador": [0.08, 0.045], "Histórico (11%)": [0.11, 0.06], "Crecimiento (13%)": [0.13, 0.07]}
     SC_GLO = {"Crash Financiero": [-0.22, -0.02, 0.75], "Colapso Sistémico": [-0.30, -0.06, 0.92], "Recesión Estándar": [-0.15, 0.01, 0.55]}
@@ -934,18 +990,15 @@ def app(
         horiz = st.slider("Horizonte", 10, 50, 40)
 
     tab_sim, tab_stress, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🧯 Stress", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
+    run_diag = False  # default: avoid NameError on reruns
 
-    # Valores forzados para Diego
-    tot_ini = default_rf + default_rv
-    pct_rv_ini = 60
+    # (tot_ini y pct_rv_ini ya estan definidos arriba)
 
     with tab_sim:
         # --- 1) Selección de modo ---
         positions: List[InstrumentPosition] = []
         rules = PortfolioRulesConfig()
         portfolio_ready = False
-        # Evita UnboundLocalError en reruns: 'edited' solo existe cuando hay DF válido y se renderiza el editor.
-        edited = None
 
         # Defaults (avoid UnboundLocalError when portfolio data is missing)
         cap_val = tot_ini
@@ -1040,28 +1093,25 @@ def app(
                     )
 
                 positions = []
-                if edited is not None:
-                    for _, r in edited.iterrows():
-                        positions.append(
-                            InstrumentPosition(
-                                instrument_id=str(r["instrument_id"]),
-                                name=str(r["name"]),
-                                value_clp=float(r["value_clp"]),
-                                rv_share=float(r["rv_share"]),
-                                rv_min=float(r.get("rv_min", 0.0)),
-                                rv_max=float(r.get("rv_max", 1.0)),
-                                liquidity_days=int(r.get("liquidity_days", 3)),
-                                bucket=str(r["bucket"]),
-                                priority=int(r["priority"]),
-                                include_withdrawals=bool(r["include_withdrawals"]),
-                            )
+                for _, r in edited.iterrows():
+                    positions.append(
+                        InstrumentPosition(
+                            instrument_id=str(r["instrument_id"]),
+                            name=str(r["name"]),
+                            value_clp=float(r["value_clp"]),
+                            rv_share=float(r["rv_share"]),
+                            rv_min=float(r.get("rv_min", 0.0)),
+                            rv_max=float(r.get("rv_max", 1.0)),
+                            liquidity_days=int(r.get("liquidity_days", 3)),
+                            bucket=str(r["bucket"]),
+                            priority=int(r["priority"]),
+                            include_withdrawals=bool(r["include_withdrawals"]),
                         )
+                    )
 
-                # Si no hubo editor (por DF inválido), no toques cap_val/rv_sl para no romper el resto de la UI.
-                if edited is not None:
-                    cap_val = int(round(tot))
-                    rv_sl = rv_pct
-                    portfolio_ready = cap_val > 0 and any(p.include_withdrawals for p in positions)
+                cap_val = int(round(tot))
+                rv_sl = rv_pct
+                portfolio_ready = cap_val > 0 and any(p.include_withdrawals for p in positions)
 
         if not use_portfolio:
             c1, c2, c3 = st.columns(3)
@@ -1075,14 +1125,25 @@ def app(
         with g3: r3 = clean_input("Gasto F3", 4000000, "r3")
 
         with st.expander("💸 Inyecciones o Salidas"):
-            if 'extra_events' not in st.session_state: st.session_state.extra_events = []
+            # extra_events y keys ya pre-inicializados más arriba; defensivamente leemos de session_state
             ce1, ce2, ce3, ce4 = st.columns([1,2,2,1])
-            with ce1: ev_y = st.number_input("Año", 1, 40, 5, key="evy")
-            with ce2: ev_a = clean_input("Monto ($)", 0, "eva")
-            with ce3: ev_t = st.selectbox("Tipo", ["Entrada", "Salida"], key="evt")
-            if ce4.button("Add"): st.session_state.extra_events.append(ExtraCashflow(ev_y, ev_a if ev_t=="Entrada" else -ev_a, "Hito"))
-            for e in st.session_state.extra_events: st.text(f"Año {e.year}: ${fmt(e.amount)}")
-            if st.button("Limpiar"): st.session_state.extra_events = []
+            with ce1:
+                ev_y = st.number_input("Año", 1, 40, st.session_state.get("evy", 5), key="evy")
+            with ce2:
+                ev_a = clean_input("Monto ($)", 0, "eva")
+            with ce3:
+                ev_t = st.selectbox("Tipo", ["Entrada", "Salida"], key="evt")
+            if ce4.button("Add"):
+                # Leer siempre desde session_state (defensivo ante reruns parciales)
+                ev_y_val = int(st.session_state.get("evy", ev_y))
+                ev_a_val = int(st.session_state.get("eva", ev_a))
+                ev_t_val = st.session_state.get("evt", "Entrada")
+                # Añadir evento con signo según tipo
+                st.session_state.extra_events.append(ExtraCashflow(ev_y_val, ev_a_val if ev_t_val == "Entrada" else -ev_a_val, "Hito"))
+            for e in st.session_state.extra_events:
+                st.text(f"Año {e.year}: ${fmt(e.amount)}")
+            if st.button("Limpiar"):
+                st.session_state.extra_events = []
 
         enable_p = st.checkbox("Venta Casa Emergencia", value=True)
         val_h = clean_input("Valor Neto Casa ($)", default_inmo_neto, "vi") if enable_p else 0
@@ -1280,7 +1341,6 @@ def app(
                 "p90_terminal_real": float(np.percentile(terminal_real, 90)),
                 "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
             }
-    run_diag = False  # default to avoid NameError on reruns
     with tab_diag:
         st.subheader("Baseline determinístico + Sensibilidad (Tornado)")
         st.caption("Esto no reemplaza el Monte Carlo: te muestra el 'camino esperado' y qué variables te mueven más el éxito.")
