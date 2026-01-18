@@ -905,6 +905,49 @@ def app(
     **_ignored_kwargs,
 ):
     st.markdown("## 🦅 Panel de Decisión Patrimonial")
+
+    # ------------------------------------------------------------------
+    # Streamlit reruns + tabs/toggles can cause parts of the function to be
+    # skipped on certain reruns. If later tabs reference variables that were
+    # only defined inside a conditional/tab block, you get UnboundLocalError.
+    # We therefore pre-initialize all cross-tab variables with safe defaults.
+    # ------------------------------------------------------------------
+
+    # Valores base (antes de leer session_state)
+    tot_ini = int(default_rf) + int(default_rv)
+    pct_rv_ini = 60
+
+    def _ss_int(key: str, default: int) -> int:
+        """Best-effort int from session_state (handles '6.000.000' style strings)."""
+        try:
+            v = st.session_state.get(key, None)
+            if v is None:
+                return int(default)
+            if isinstance(v, (int, float)):
+                return int(v)
+            s = str(v)
+            s = re.sub(r"\D", "", s)
+            return int(s) if s else int(default)
+        except Exception:
+            return int(default)
+
+    # Cross-tab defaults
+    positions: List[InstrumentPosition] = []
+    rules = PortfolioRulesConfig()
+    portfolio_ready = False
+
+    cap_val = _ss_int("cap", tot_ini)
+    rv_sl = int(st.session_state.get("rv_sl", 60))
+    rv_pct = float(rv_sl)
+
+    # Spending defaults (kept in session_state by clean_input)
+    r1 = _ss_int("r1", 6000000)
+    r2 = _ss_int("r2", 4000000)
+    r3 = _ss_int("r3", 4000000)
+
+    # Property / housing defaults
+    enable_p = bool(st.session_state.get("enable_p", True))
+    val_h = _ss_int("vi", int(default_inmo_neto)) if enable_p else 0
     
     SC_RET = {"Conservador": [0.08, 0.045], "Histórico (11%)": [0.11, 0.06], "Crecimiento (13%)": [0.13, 0.07]}
     SC_GLO = {"Crash Financiero": [-0.22, -0.02, 0.75], "Colapso Sistémico": [-0.30, -0.06, 0.92], "Recesión Estándar": [-0.15, 0.01, 0.55]}
@@ -936,9 +979,7 @@ def app(
     tab_sim, tab_stress, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🧯 Stress", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
     run_diag = False  # default: avoid NameError on reruns
 
-    # Valores forzados para Diego
-    tot_ini = default_rf + default_rv
-    pct_rv_ini = 60
+    # (tot_ini y pct_rv_ini ya estan definidos arriba)
 
     with tab_sim:
         # --- 1) Selección de modo ---
