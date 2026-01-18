@@ -945,6 +945,11 @@ def app(
         rules = PortfolioRulesConfig()
         portfolio_ready = False
 
+        # Defaults (avoid UnboundLocalError when portfolio data is missing)
+        cap_val = tot_ini
+        rv_sl = pct_rv_ini
+        rv_pct = float(rv_sl)
+
         if use_portfolio:
             st.subheader("📦 Cartera Real (Instrumentos)")
             st.caption("Edita el % RV de cada instrumento y su prioridad de retiro. Por defecto: RF pura primero → luego balanceados → lo más RV al final.")
