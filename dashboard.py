@@ -57,6 +57,9 @@ if df_cartera is not None:
         'usd': df_cartera[df_cartera["bucket_sim"]=="USD"]["saldo_nominal"].sum(),
         'tc': tc_val, 'inmo_neto': neto_inmo
     }
+    # Disponibles para el modo "Cartera Real" dentro del simulador
+    st.session_state["portfolio_df"] = df_cartera.copy()
+    st.session_state["portfolio_macro"] = macro_data
 
 def fmt(v): return f"${int(v):,}".replace(",", ".")
 
@@ -90,7 +93,9 @@ def render_simulador():
     simulador.app(
         default_rf=total_defensa,      
         default_rv=total_motor,        
-        default_inmo_neto=d.get('inmo_neto', 0)
+        default_inmo_neto=d.get('inmo_neto', 0),
+        portfolio_df=st.session_state.get("portfolio_df"),
+        macro_data=st.session_state.get("portfolio_macro")
     )
 
 if st.session_state.vista_actual == 'HOME': render_home()
