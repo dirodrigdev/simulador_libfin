@@ -217,19 +217,24 @@ def default_instrument_meta() -> Dict[str, Dict[str, Any]]:
     """
     return {
         # --- SURA (Seguro de Vida) ---
-        "SURA_SEGURO_MULTIACTIVO_AGRESIVO_SERIE_F": {"rv_share": 0.8913, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 4, "bucket": "RV", "priority": 40},
+        # Mandato oficial: instrumentos de capitalización min 60% / max 100% (ver ficha).
+        "SURA_SEGURO_MULTIACTIVO_AGRESIVO_SERIE_F": {"rv_share": 0.8913, "rv_min": 0.60, "rv_max": 1.00, "liquidity_days": 4, "bucket": "RV", "priority": 40},
         "SURA_SEGURO_MULTIACTIVO_MODERADO_SERIE_F": {"rv_share": 0.5452, "rv_min": 0.30, "rv_max": 0.60, "liquidity_days": 4, "bucket": "BAL", "priority": 35},
         "SURA_SEGURO_RENTA_LOCAL_UF_SERIE_F": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 0},
         "SURA_SEGURO_RENTA_BONOS_CHILE_SF": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 0},
 
         # --- BTG (Fondos Mutuos) ---
-        # Nota: estos rv_share vienen de la radiografia que compartiste (no del "mandato tipico"), por eso pueden ser <90%.
-        "BTG_GESTION_AGRESIVA": {"rv_share": 0.6854, "rv_min": 0.60, "rv_max": 0.90, "liquidity_days": 3, "bucket": "BAL", "priority": 45},
-        "BTG_GESTION_ACTIVA": {"rv_share": 0.3445, "rv_min": 0.20, "rv_max": 0.70, "liquidity_days": 3, "bucket": "BAL", "priority": 30},
-        "BTG_GESTION_CONSERVADORA": {"rv_share": 0.1773, "rv_min": 0.00, "rv_max": 0.30, "liquidity_days": 1, "bucket": "BAL", "priority": 15},
+        # RV estimada desde la "Distribución por Clase de Activo" de cada ficha.
+        # - Gestión Agresiva: RV Int + RV Nac ≈ 68.54%. Mandato: capitalización 0..90%.
+        "BTG_GESTION_AGRESIVA": {"rv_share": 0.6854, "rv_min": 0.00, "rv_max": 0.90, "liquidity_days": 2, "bucket": "BAL", "priority": 45},
+        # - Gestión Activa: RV Int + RV Nac ≈ 38.65% (según ficha). Banda exacta del mandato no aparece en el extracto, se deja amplia.
+        "BTG_GESTION_ACTIVA": {"rv_share": 0.3865, "rv_min": 0.00, "rv_max": 0.90, "liquidity_days": 2, "bucket": "BAL", "priority": 30},
+        # - Gestión Conservadora: por mandato deuda >=80% => RV <=20%. RV actual ≈ 17.73%.
+        "BTG_GESTION_CONSERVADORA": {"rv_share": 0.1773, "rv_min": 0.00, "rv_max": 0.20, "liquidity_days": 1, "bucket": "BAL", "priority": 15},
 
         # --- Fondo de inversión / crédito privado ---
-        "MONEDA_RENTA_CLP": {"rv_share": 0.05, "rv_min": 0.0, "rv_max": 0.15, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 5},
+        # Moneda Renta CLP (fondo de inversión): acciones ~2.9% (resto deuda/alternativos)
+        "MONEDA_RENTA_CLP": {"rv_share": 0.029, "rv_min": 0.0, "rv_max": 0.10, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 5},
 
         # --- DAP y caja ---
         "DAP_CLP_10122025": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 0, "bucket": "RF_PURA", "priority": 0},
@@ -792,14 +797,11 @@ def app(
                         is_active_managed=is_active,
                         enable_prop=enable_p,
                         net_inmo_value=val_h,
-                        new_rent_cost=rent_cost,
                         mu_normal_rv=c_rv,
                         mu_normal_rf=c_rf,
-                        mu_global_rv=mu_g_rv,
-                        mu_global_rf=mu_g_rf,
-                        p_enter_global=p_ent_g,
-                        p_exit_global=p_sal_g,
-                        corr_global=corr,
+                        mu_global_rv=SC_GLO[sel_glo][0],
+                        mu_global_rf=SC_GLO[sel_glo][1],
+                        corr_global=SC_GLO[sel_glo][2],
                         extra_cashflows=st.session_state.extra_events,
                     )
                     _, _, ri = InstitutionalSimulator(c_t, a_t, w_t).run()

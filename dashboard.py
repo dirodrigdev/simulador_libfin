@@ -90,22 +90,18 @@ def render_simulador():
     total_defensa = saldo_rf + saldo_mx + saldo_usd_clp
     total_motor = d.get('rv', 0)
 
-    # LLAMADA AL MOTOR (compatible con versiones antiguas de simulador.py)
+    # LLAMADA AL MOTOR (robusta a cambios de firma en simulador.app)
     sig = inspect.signature(simulador.app)
-    if "portfolio_df" in sig.parameters or "macro_data" in sig.parameters:
-        simulador.app(
-            default_rf=total_defensa,
-            default_rv=total_motor,
-            default_inmo_neto=d.get('inmo_neto', 0),
-            portfolio_df=st.session_state.get("portfolio_df"),
-            macro_data=st.session_state.get("portfolio_macro")
-        )
-    else:
-        simulador.app(
-            default_rf=total_defensa,
-            default_rv=total_motor,
-            default_inmo_neto=d.get('inmo_neto', 0)
-        )
+    kwargs = {
+        "default_rf": total_defensa,
+        "default_rv": total_motor,
+        "default_inmo_neto": d.get('inmo_neto', 0),
+        "portfolio_df": st.session_state.get("portfolio_df"),
+        "macro_data": st.session_state.get("portfolio_macro"),
+        "portfolio_json": st.session_state.get("portfolio_json"),
+    }
+    safe_kwargs = {k: v for k, v in kwargs.items() if k in sig.parameters}
+    simulador.app(**safe_kwargs)
 
 if st.session_state.vista_actual == 'HOME': render_home()
 elif st.session_state.vista_actual == 'SIMULADOR': render_simulador()
