@@ -1133,7 +1133,9 @@ def app(
                 "p90_path": pcts[2].tolist(),
                 "cpi_p50": np.percentile(cpi, 50, axis=0).tolist(),
                 "cap_val": int(cap_val),
+                # Mix input (0-100). Keep both rv_pct and rv_weight for compatibility with older/newer Summary views.
                 "rv_pct": float(rv_pct) if use_portfolio else float(rv_sl),
+                "rv_weight": (float(rv_pct) / 100.0) if use_portfolio else (float(rv_sl) / 100.0),
                 "withdrawals": [
                     {"from": 0, "to": int(d1), "amount": float(r1)},
                     {"from": int(d1), "to": int(d1) + int(d2), "amount": float(r2)},
@@ -1342,7 +1344,15 @@ def app(
             st.write(f"- Horizonte: **{last['horizon_years']} años** | Sims: **{last['n_sims']}**")
             infl = last['cfg'].get('inflation_mean'); mu_rv = last['cfg'].get('mu_normal_rv'); mu_rf = last['cfg'].get('mu_normal_rf')
             st.write(f"- Inflación media: **{infl:.3f}** | RV mu: **{mu_rv:.3f}** | RF mu: **{mu_rf:.3f}**" if (infl is not None and mu_rv is not None and mu_rf is not None) else '- Inflación/retornos: (no disponibles)')
-            st.write(f"- Mix RV/RF (input): **{(last['rv_weight']*100):.0f}% / {(100-last['rv_weight']*100):.0f}%**")
+            # Mix display: prefer rv_pct (0-100). Fallback to rv_weight (0-1) if needed.
+            _rv_pct = last.get('rv_pct', None)
+            if _rv_pct is None:
+                _rv_w = last.get('rv_weight', None)
+                _rv_pct = (_rv_w * 100.0) if _rv_w is not None else None
+            if _rv_pct is not None:
+                st.write(f"- Mix RV/RF (input): **{_rv_pct:.0f}% / {(100 - _rv_pct):.0f}%**")
+            else:
+                st.write("- Mix RV/RF (input): (no disponible)")
 
             st.markdown("### Plan de gasto")
             for w in last['withdrawals']:
