@@ -12,14 +12,28 @@ import json
 def fmt(v): return f"{int(v):,}".replace(",", ".")
 
 def clean_input(label, val, key):
-    # Usamos session_state para persistencia
-    if key not in st.session_state:
-        st.session_state[key] = fmt(val)
-    
-    val_str = st.text_input(label, value=st.session_state[key], key=key)
-    clean_val = re.sub(r'\.', '', val_str)
+    """Input numérico robusto.
+
+    Importante: el `key` del widget NO debe reutilizarse con otros tipos de widget.
+    Para evitar colisiones con estados antiguos del navegador (p.ej. si antes ese key era
+    un checkbox/number_input), usamos un key interno namespaced para el text_input.
+    """
+    widget_key = f"txt__{key}"
+
+    # Persistimos el texto del widget (siempre string)
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = fmt(val)
+    elif not isinstance(st.session_state.get(widget_key), str):
+        st.session_state[widget_key] = str(st.session_state[widget_key])
+
+    val_str = st.text_input(label, value=st.session_state[widget_key], key=widget_key)
+    clean_val = re.sub(r'\.', '', str(val_str))
     clean_val = re.sub(r'\D', '', clean_val)
-    return int(clean_val) if clean_val else 0
+    out = int(clean_val) if clean_val else 0
+
+    # Guardamos el valor numérico aparte (no es key de widget)
+    st.session_state[f"num__{key}"] = out
+    return out
 
 def fmt_pct(v): return f"{v*100:.1f}%"
 
@@ -904,63 +918,20 @@ def app(
     portfolio_json: Optional[str] = None,
     **_ignored_kwargs,
 ):
-    st.markdown("## 🦅 Panel de Decisión Patrimonial")
+    # --- Pre-init claves usadas en reruns (evita UnboundLocalError) ---
+    st.session_state.setdefault('extra_events', [])
+    st.session_state.setdefault('evy', 5)
+    st.session_state.setdefault('eva', fmt(0))
+    st.session_state.setdefault('evt', 'Entrada')
+    st.session_state.setdefault('use_portfolio', False)
 
-    # ------------------------------------------------------------------
-    # Streamlit reruns + tabs/toggles can cause parts of the function to be
-    # skipped on certain reruns. If later tabs reference variables that were
-    # only defined inside a conditional/tab block, you get UnboundLocalError.
-    # We therefore pre-initialize all cross-tab variables with safe defaults.
-    # ------------------------------------------------------------------
-
-    # Pre-initialize session keys that the UI reads/writes across reruns
-    _defaults = {
-        "extra_events": [],            # stored as list of dicts: {"year":int, "amount":float, "name":str}
-        "evt": "Entrada",              # valor por defecto para el selectbox Tipo
-        "evy": 5,                      # Año por defecto
-        "eva": fmt(0),                 # Monto por defecto (string) -> evita TypeError en text_input
-        "portfolio_json": st.session_state.get("portfolio_json", ""),
-        "use_portfolio": st.session_state.get("use_portfolio", False),
-    }
-    for _k, _v in _defaults.items():
-        if _k not in st.session_state:
-            st.session_state[_k] = _v
-
-    # Valores base (antes de leer session_state)
-    tot_ini = int(default_rf) + int(default_rv)
-    pct_rv_ini = 60
-
-    def _ss_int(key: str, default: int) -> int:
-        """Best-effort int from session_state (handles '6.000.000' style strings)."""
-        try:
-            v = st.session_state.get(key, None)
-            if v is None:
-                return int(default)
-            if isinstance(v, (int, float)):
-                return int(v)
-            s = str(v)
-            s = re.sub(r"\D", "", s)
-            return int(s) if s else int(default)
-        except Exception:
-            return int(default)
-
-    # Cross-tab defaults
+    # Defaults locales (evita variables no inicializadas al cambiar modo)
     positions: List[InstrumentPosition] = []
     rules = PortfolioRulesConfig()
     portfolio_ready = False
+    edited = None  # df editable en modo cartera
 
-    cap_val = _ss_int("cap", tot_ini)
-    rv_sl = int(st.session_state.get("rv_sl", 60))
-    rv_pct = float(rv_sl)
-
-    # Spending defaults (kept in session_state by clean_input)
-    r1 = _ss_int("r1", 6000000)
-    r2 = _ss_int("r2", 4000000)
-    r3 = _ss_int("r3", 4000000)
-
-    # Property / housing defaults
-    enable_p = bool(st.session_state.get("enable_p", True))
-    val_h = _ss_int("vi", int(default_inmo_neto)) if enable_p else 0
+    st.markdown("## 🦅 Panel de Decisión Patrimonial")
     
     SC_RET = {"Conservador": [0.08, 0.045], "Histórico (11%)": [0.11, 0.06], "Crecimiento (13%)": [0.13, 0.07]}
     SC_GLO = {"Crash Financiero": [-0.22, -0.02, 0.75], "Colapso Sistémico": [-0.30, -0.06, 0.92], "Recesión Estándar": [-0.15, 0.01, 0.55]}
@@ -990,9 +961,10 @@ def app(
         horiz = st.slider("Horizonte", 10, 50, 40)
 
     tab_sim, tab_stress, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🧯 Stress", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
-    run_diag = False  # default: avoid NameError on reruns
 
-    # (tot_ini y pct_rv_ini ya estan definidos arriba)
+    # Valores forzados para Diego
+    tot_ini = default_rf + default_rv
+    pct_rv_ini = 60
 
     with tab_sim:
         # --- 1) Selección de modo ---
@@ -1035,6 +1007,10 @@ def app(
             else:
                 df_base = _normalize_portfolio_df(df_src)
                 df_base = enrich_with_meta(df_base)
+
+                # Fallback defensivo: si Streamlit re-ejecuta y algo falla antes de asignar,
+                # al menos 'edited' existe (evita UnboundLocalError en iterrows).
+                edited = df_base.copy()
 
                 edited = st.data_editor(
                     df_base,
@@ -1093,21 +1069,39 @@ def app(
                     )
 
                 positions = []
-                for _, r in edited.iterrows():
-                    positions.append(
-                        InstrumentPosition(
-                            instrument_id=str(r["instrument_id"]),
-                            name=str(r["name"]),
-                            value_clp=float(r["value_clp"]),
-                            rv_share=float(r["rv_share"]),
-                            rv_min=float(r.get("rv_min", 0.0)),
-                            rv_max=float(r.get("rv_max", 1.0)),
-                            liquidity_days=int(r.get("liquidity_days", 3)),
-                            bucket=str(r["bucket"]),
-                            priority=int(r["priority"]),
-                            include_withdrawals=bool(r["include_withdrawals"]),
+
+                if edited is not None:
+
+                    for _, r in edited.iterrows():
+
+                        positions.append(
+
+                            InstrumentPosition(
+
+                                instrument_id=str(r["instrument_id"]),
+
+                                name=str(r["name"]),
+
+                                value_clp=float(r["value_clp"]),
+
+                                rv_share=float(r["rv_share"]),
+
+                                rv_min=float(r.get("rv_min", 0.0)),
+
+                                rv_max=float(r.get("rv_max", 1.0)),
+
+                                liquidity_days=int(r.get("liquidity_days", 3)),
+
+                                bucket=str(r["bucket"]),
+
+                                priority=int(r["priority"]),
+
+                                include_withdrawals=bool(r["include_withdrawals"]),
+
+                            )
+
                         )
-                    )
+
 
                 cap_val = int(round(tot))
                 rv_sl = rv_pct
@@ -1125,31 +1119,33 @@ def app(
         with g3: r3 = clean_input("Gasto F3", 4000000, "r3")
 
         with st.expander("💸 Inyecciones o Salidas"):
-            # extra_events ahora se almacena como lista de dicts en session_state para robustez en despliegues
+            # Estado persistente para evitar errores en reruns
+            st.session_state.setdefault('extra_events', [])
             ce1, ce2, ce3, ce4 = st.columns([1,2,2,1])
-            with ce1: ev_y = st.number_input("Año", 1, 40, st.session_state.get("evy", 5), key="evy")
-            with ce2: ev_a = clean_input("Monto ($)", 0, "eva")
-            with ce3: ev_t = st.selectbox("Tipo", ["Entrada", "Salida"], key="evt")
-            if ce4.button("Add"):
-                # Leer siempre desde session_state (defensivo ante reruns parciales)
-                ev_y_val = int(st.session_state.get("evy", ev_y))
-                ev_a_val = int(st.session_state.get("eva", ev_a))
-                ev_t_val = st.session_state.get("evt", "Entrada")
-                amt = ev_a_val if ev_t_val == "Entrada" else -ev_a_val
-                st.session_state.extra_events.append({"year": ev_y_val, "amount": float(amt), "name": "Hito"})
-            # Mostrar eventos desde session_state (dicts)
-            for e in st.session_state.extra_events:
-                yr = e.get("year")
-                am = e.get("amount")
-                st.text(f"Año {yr}: ${fmt(am)}")
-            if st.button("Limpiar"):
-                st.session_state.extra_events = []
+            with ce1:
+                st.number_input('Año', 1, 40, int(st.session_state.get('evy', 5)), key='evy')
+            with ce2:
+                clean_input('Monto ($)', 0, 'eva')
+            with ce3:
+                st.selectbox('Tipo', ['Entrada', 'Salida'], key='evt')
+            with ce4:
+                if st.button('Add'):
+                    y = int(st.session_state.get('evy', 1))
+                    # clean_input devuelve int, pero guardamos el string formateado en session_state['eva']
+                    try:
+                        a = int(re.sub(r'\D', '', str(st.session_state.get('eva', '0'))))
+                    except Exception:
+                        a = 0
+                    t = str(st.session_state.get('evt', 'Entrada'))
+                    amt = a if t == 'Entrada' else -a
+                    st.session_state['extra_events'].append(ExtraCashflow(y, amt, 'Hito'))
+            for e in st.session_state['extra_events']:
+                st.text(f"Año {e.year}: ${fmt(e.amount)}")
+            if st.button('Limpiar'):
+                st.session_state['extra_events'] = []
 
         enable_p = st.checkbox("Venta Casa Emergencia", value=True)
         val_h = clean_input("Valor Neto Casa ($)", default_inmo_neto, "vi") if enable_p else 0
-
-        # Convertir extra_events (lista de dicts) a ExtraCashflow dataclass para la configuración
-        extra_events_objs = [ExtraCashflow(int(e["year"]), float(e["amount"]), e.get("name", "Hito")) for e in st.session_state.get("extra_events", [])]
 
         wds_current = _build_withdrawals(horiz, r1, d1, r2, d2, r3)
         cfg_current = SimulationConfig(
@@ -1161,7 +1157,7 @@ def app(
             net_inmo_value=val_h,
             mu_normal_rv=c_rv,
             mu_normal_rf=c_rf,
-            extra_cashflows=extra_events_objs,
+            extra_cashflows=st.session_state.extra_events,
             mu_global_rv=SC_GLO[sel_glo][0],
             mu_global_rf=SC_GLO[sel_glo][1],
             corr_global=SC_GLO[sel_glo][2],
@@ -1218,6 +1214,10 @@ def app(
                 "cfg": cfg_current.__dict__.copy(),
                 "rules": rules.__dict__.copy() if use_portfolio else None,
             }
+
+
+    
+
 
 
     with tab_stress:
@@ -1340,3 +1340,309 @@ def app(
                 "p90_terminal_real": float(np.percentile(terminal_real, 90)),
                 "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
             }
+    run_diag = False  # default to avoid NameError on reruns
+    with tab_diag:
+        st.subheader("Baseline determinístico + Sensibilidad (Tornado)")
+        st.caption("Esto no reemplaza el Monte Carlo: te muestra el 'camino esperado' y qué variables te mueven más el éxito.")
+
+        sims_diag = st.slider("Sims por punto (tornado)", 100, 800, 300, step=50, key="sims_diag")
+        target_diag = st.slider("Meta de éxito (para plan de acción)", 70, 100, 95, step=1, key="target_diag")
+        run_diag = st.button("🩻 Ejecutar diagnóstico", key="run_diag")
+
+        if run_diag:
+            with st.spinner("Corriendo diagnóstico..."):
+                # Baseline determinístico (sin crisis)
+                if use_portfolio:
+                    # Baseline aproximado en modo cartera: usamos los %RV efectivos por instrumento y el orden de retiro
+                    # (la idea es intuición, no precisión milimétrica)
+                    pos = [PortfolioPosition(**pp.__dict__) for pp in positions]  # copia
+                    cap_det, cpi_det = _deterministic_portfolio(replace(cfg_current, enable_prop=False), positions, rules, wds_current)
+                else:
+                    cap_det, cpi_det = _deterministic_institutional(cfg_current, wds_current, rv_weight=float(rv_sl)/100.0)
+
+                real_det = cap_det / np.maximum(cpi_det, 1e-9)
+                x = list(range(len(real_det)))
+                fig_det = go.Figure()
+                fig_det.add_trace(go.Scatter(x=x, y=real_det, name="Patrimonio real (determinístico)"))
+                fig_det.update_layout(title="Proyección determinística (real)", xaxis_title="Mes", yaxis_title="CLP reales")
+                st.plotly_chart(fig_det, use_container_width=True)
+
+                # Tornado (% éxito)
+                base_p, rows = _tornado(
+                    cfg_current,
+                    wds_current,
+                    use_portfolio=bool(use_portfolio),
+                    rv_weight=float(rv_pct)/100.0 if use_portfolio else float(rv_sl)/100.0,
+                    sims_per_point=int(sims_diag),
+                    positions=positions if use_portfolio else None,
+                    rules=rules if use_portfolio else None,
+                )
+
+                st.metric("Éxito base (diagnóstico)", f"{base_p:.1f}%")
+                # guardamos para resumen
+                st.session_state["last_tornado"] = {"base": base_p, "rows": rows, "sims": int(sims_diag)}
+
+                # chart tornado
+                drivers = [r['driver'] for r in rows]
+                bad = [r['bad'] - base_p for r in rows]
+                good = [r['good'] - base_p for r in rows]
+
+                fig_t = go.Figure()
+                fig_t.add_trace(go.Bar(y=drivers, x=bad, orientation='h', name='Peor caso'))
+                fig_t.add_trace(go.Bar(y=drivers, x=good, orientation='h', name='Mejor caso'))
+                fig_t.update_layout(
+                    title="Tornado: impacto en % éxito (vs base)",
+                    xaxis_title="Δ % éxito",
+                    barmode='overlay',
+                )
+                st.plotly_chart(fig_t, use_container_width=True)
+
+                st.caption("Interpretación: si 'Inflación media' te pega más que 'Retorno RV', tu problema no es 'más acciones': es cobertura de inflación y gasto.")
+
+                # --- Cuadro de interpretación y acciones ---
+                st.markdown("---")
+                st.subheader("Interpretación y acciones")
+                st.caption("Lo de arriba te dice 'qué duele'. Esto te dice 'qué puedes hacer' (y qué no).")
+
+                meaning = {
+                    "Retorno RV (mu)": "El 'motor' esperado. Si rinde menos, tu plan se achica. No es palanca directa: es incertidumbre de mercado.",
+                    "Inflacion media": "El impuesto invisible. Si la inflación sube, tu gasto real sube y el capital real cae.",
+                    "Gasto (todos tramos)": "Tu tasa de extracción. Esta sí es palanca directa (y suele ser la #1).",
+                    "Prob crisis global": "Frecuencia de años feos globales (caen casi todos juntos). No se controla: se mitiga.",
+                    "Prob crisis local": "Frecuencia de crisis 'Chile'. No se controla: se mitiga con UF, reserva y diversificación.",
+                    "Retorno RF (mu)": "Rendimiento de tu defensa. Más bajo = menos colchón. Parcialmente mitigable con instrumentos/UF/duración.",
+                }
+
+                interp_rows = []
+                for r in rows:
+                    d_bad = r["bad"] - base_p
+                    d_good = r["good"] - base_p
+                    imp = float(r["impact_abs"])
+                    if imp >= 8:
+                        lvl = "Alta"
+                    elif imp >= 4:
+                        lvl = "Media"
+                    else:
+                        lvl = "Baja"
+                    interp_rows.append({
+                        "Factor": r["driver"],
+                        "Importancia": lvl,
+                        "Δ peor (pp)": round(d_bad, 1),
+                        "Δ mejor (pp)": round(d_good, 1),
+                        "Qué significa": meaning.get(r["driver"], "—"),
+                    })
+
+                df_interp = pd.DataFrame(interp_rows)
+                st.markdown("### 🧠 Cuadro de interpretación")
+                st.dataframe(df_interp, use_container_width=True, hide_index=True)
+
+                # --- Acciones (palancas reales) ---
+                st.markdown("### 🛠️ Cuadro de acción (lo que sí puedes tocar)")
+                st.caption("Las cifras de 'impacto' son aproximadas: vienen del tornado (cambio 1 a la vez). Úsalo como brújula, no como GPS.")
+
+                def _find(driver_name: str):
+                    return next((rr for rr in rows if rr.get("driver") == driver_name), None)
+
+                actions = []
+                def _add(palanca: str, donde: str, efecto: str, para_que: str, tradeoff: str):
+                    actions.append({
+                        "Palanca": palanca,
+                        "Dónde se toca": donde,
+                        "Efecto estimado": efecto,
+                        "Para qué sirve": para_que,
+                        "Trade-off": tradeoff,
+                    })
+
+                # 1) Gasto (siempre accionable)
+                r_sp = _find("Gasto (todos tramos)")
+                eff_sp = (r_sp["good"] - base_p) if r_sp else None  # good = -10%
+                rec_txt = "—"
+                if eff_sp is not None and eff_sp > 0 and target_diag > base_p:
+                    need = float(target_diag - base_p)
+                    cut_pct = min(40.0, (need / eff_sp) * 10.0)
+                    rec_txt = f"-10% gasto ≈ {eff_sp:+.1f} pp | para llegar a {target_diag:.0f}%: ~{cut_pct:.0f}% (estimación)"
+                elif eff_sp is not None:
+                    rec_txt = f"-10% gasto ≈ {eff_sp:+.1f} pp"
+
+                _add(
+                    "Ajustar gasto",
+                    "Tramos de retiro (F1/F2/F3)",
+                    rec_txt,
+                    "Subir % éxito y reducir riesgo de 'secuencia de retornos'.",
+                    "Más éxito = menos vida social (o más disciplina).",
+                )
+
+                # 2) Reserva RF pura + risk-off de balanceados (solo modo cartera)
+                if use_portfolio:
+                    sims_actions = int(min(200, sims_diag))
+                    base_cfg_fast = replace(cfg_current, n_sims=sims_actions, random_seed=777)
+                    try:
+                        p0_fast = _run_success(
+                            base_cfg_fast,
+                            wds_current,
+                            True,
+                            rv_weight=float(rv_pct)/100.0,
+                            positions=positions,
+                            rules=rules,
+                        )
+                    except Exception:
+                        p0_fast = base_p
+
+                    # RF reserve years
+                    try:
+                        r_plus = replace(rules, rf_reserve_years=float(min(6.0, rules.rf_reserve_years + 0.5)))
+                        p_plus = _run_success(base_cfg_fast, wds_current, True, rv_weight=float(rv_pct)/100.0, positions=positions, rules=r_plus)
+                        eff = p_plus - p0_fast
+                        eff_txt = f"+0.5 años RF ≈ {eff:+.1f} pp"
+                    except Exception:
+                        eff_txt = "(no calculado)"
+
+                    _add(
+                        "Aumentar reserva RF pura",
+                        "Reglas cartera: 'Reserva RF (años)'",
+                        eff_txt,
+                        "Comprar tiempo en crisis sin tocar RV a mal precio.",
+                        "Más RF = menos crecimiento (pero más sueño).",
+                    )
+
+                    # Manager risk-off in crisis
+                    try:
+                        r_plus = replace(rules, manager_riskoff_in_crisis=float(min(1.0, rules.manager_riskoff_in_crisis + 0.25)))
+                        p_plus = _run_success(base_cfg_fast, wds_current, True, rv_weight=float(rv_pct)/100.0, positions=positions, rules=r_plus)
+                        eff = p_plus - p0_fast
+                        eff_txt = f"+0.25 risk-off ≈ {eff:+.1f} pp"
+                    except Exception:
+                        eff_txt = "(no calculado)"
+
+                    _add(
+                        "Volver balanceados más defensivos en crisis",
+                        "Reglas cartera: 'Risk-off en crisis'",
+                        eff_txt,
+                        "Reducir drawdowns cuando el mercado se pone feo.",
+                        "Si el rebote es rápido, podrías capturar menos recuperación.",
+                    )
+
+                    # Rebalance only when normal (palanca de control)
+                    _add(
+                        "Rebalance solo fuera de crisis",
+                        "Reglas cartera: 'Rebalancear solo en Normal'",
+                        "No cambia el mundo, pero evita ventas forzadas en el peor momento.",
+                        "Evitar rotación destructiva cuando hay pánico.",
+                        "Puede tardar más en volver al mix objetivo.",
+                    )
+
+                else:
+                    _add(
+                        "Ajustar mix RV/RF",
+                        "Slider 'Mix RV/RF'",
+                        "Prueba 55/45, 60/40, 65/35 y mira sensibilidad.",
+                        "Equilibrar crecimiento vs drawdown.",
+                        "Más RV = más volatilidad (y viceversa).",
+                    )
+
+                # 3) Inflación y crisis (mitigación, no control)
+                r_inf = _find("Inflacion media")
+                eff_inf = (r_inf["bad"] - base_p) if r_inf else None  # bad = +1pp
+                inf_txt = f"+1pp inflación ≈ {eff_inf:+.1f} pp" if eff_inf is not None else "—"
+                _add(
+                    "Blindaje contra inflación",
+                    "Composición: más UF / ajustar gasto real",
+                    inf_txt,
+                    "Proteger poder de compra (especialmente en Chile).",
+                    "Más UF/defensa puede bajar crecimiento esperado.",
+                )
+
+                df_act = pd.DataFrame(actions)
+                st.dataframe(df_act, use_container_width=True, hide_index=True)
+
+                st.info("Si quieres, el siguiente paso es que el optimizador use estas palancas (gasto/mix/reserva) para buscar automáticamente el 'mínimo ajuste' que te lleva a tu meta.")
+
+    with tab_sum:
+        st.subheader("Resumen ejecutivo")
+
+        last = st.session_state.get("last_run")
+        if not last:
+            st.info("Primero ejecuta una simulación en la pestaña 'Simulación' para generar el resumen.")
+        else:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Éxito", f"{last['success_pct']:.1f}%")
+            c2.metric("Terminal real (mediana)", fmt(last['median_terminal_real']))
+            mr = last.get('median_ruin_year')
+            c3.metric("Año mediano de ruina", (f"{mr:.1f}" if mr is not None else "—"))
+
+            st.markdown("### Supuestos clave")
+            st.write(f"- Horizonte: **{last['horizon_years']} años** | Sims: **{last['n_sims']}**")
+            infl = last['cfg'].get('inflation_mean'); mu_rv = last['cfg'].get('mu_normal_rv'); mu_rf = last['cfg'].get('mu_normal_rf')
+            st.write(f"- Inflación media: **{infl:.3f}** | RV mu: **{mu_rv:.3f}** | RF mu: **{mu_rf:.3f}**" if (infl is not None and mu_rv is not None and mu_rf is not None) else '- Inflación/retornos: (no disponibles)')
+            # Mix display: prefer rv_pct (0-100). Fallback to rv_weight (0-1) if needed.
+            _rv_pct = last.get('rv_pct', None)
+            if _rv_pct is None:
+                _rv_w = last.get('rv_weight', None)
+                _rv_pct = (_rv_w * 100.0) if _rv_w is not None else None
+            if _rv_pct is not None:
+                st.write(f"- Mix RV/RF (input): **{_rv_pct:.0f}% / {(100 - _rv_pct):.0f}%**")
+            else:
+                st.write("- Mix RV/RF (input): (no disponible)")
+
+            st.markdown("### Plan de gasto")
+            for w in last['withdrawals']:
+                st.write(f"- {w['from']}–{w['to']} años: **{fmt(int(w['amount']))} CLP/mes (nominal)**")
+
+            tornado = st.session_state.get("last_tornado")
+            if tornado and tornado.get('rows'):
+                st.markdown("### Principales drivers de riesgo")
+                top = tornado['rows'][:3]
+                for r in top:
+                    st.write(f"- **{r['driver']}** (rango éxito: {r['bad']:.1f}% – {r['good']:.1f}%)")
+
+            st.markdown("### Recomendación (heurística)")
+            p = last['success_pct']
+            if p >= 95:
+                st.success("Estás en zona cómoda. Igual mira el tornado: si inflación domina, la 'comodidad' se compra con cobertura y disciplina de gasto.")
+            elif p >= 85:
+                st.warning("Estás en zona 'aceptable pero no premium'. Si quieres >95%, necesitas o bajar gasto, o subir defensa/liquidez, o reducir exposición a crisis (o las 3).")
+            else:
+                st.error("Zona de riesgo. Con estos supuestos, tu plan se rompe demasiado seguido. Hay que ajustar gasto/mix/reserva.")
+
+            st.caption("Este resumen es para decidir 'qué palanca tocar'. La decisión final siempre debe cruzarse con realidad operativa (impuestos, liquidez real, restricciones).")
+
+
+    with tab_opt:
+            st.subheader("🎯 Buscador de Soluciones Estratégicas")
+            target = st.slider("Meta Éxito %", 70, 100, 95)
+            opt_var = st.selectbox("Optimizar:", ["Mix RV %", "Gasto Fase 1", "Gasto Fase 2", "Gasto Fase 3"])
+            if st.button("🔍 CALCULAR ÓPTIMO"):
+                res = []
+                with st.spinner("Ejecutando..."):
+                    if "Mix" in opt_var:
+                        vals = np.linspace(0, 100, 11)
+                    else:
+                        base = r1 if "1" in opt_var else (r2 if "2" in opt_var else r3)
+                        vals = np.linspace(base*0.4, base*1.6, 11)
+                    seed = 12345  # Common Random Numbers para comparar manzanas con manzanas
+                    for v in vals:
+                        cur_rv = v/100 if "Mix" in opt_var else rv_sl/100
+                        a_t = [AssetBucket("RV", cur_rv), AssetBucket("RF", (1-cur_rv), True)]
+                        tw1 = (v if opt_var == "Gasto Fase 1" else r1)
+                        tw2 = (v if opt_var == "Gasto Fase 2" else r2)
+                        tw3 = (v if opt_var == "Gasto Fase 3" else r3)
+                        w_t = [WithdrawalTramo(0, d1, tw1), WithdrawalTramo(d1, d1+d2, tw2), WithdrawalTramo(d1+d2, horiz, tw3)]
+                        c_t = SimulationConfig(
+                            horizon_years=horiz,
+                            initial_capital=cap_val,
+                            n_sims=400,
+                            random_seed=seed,
+                            is_active_managed=is_active,
+                            enable_prop=enable_p,
+                            net_inmo_value=val_h,
+                            mu_normal_rv=c_rv,
+                            mu_normal_rf=c_rf,
+                            mu_global_rv=SC_GLO[sel_glo][0],
+                            mu_global_rf=SC_GLO[sel_glo][1],
+                            corr_global=SC_GLO[sel_glo][2],
+                            extra_cashflows=st.session_state.extra_events,
+                        )
+                        _, _, ri = InstitutionalSimulator(c_t, a_t, w_t).run()
+                        res.append({"v": v, "p": (1-(np.sum(ri>-1)/400))*100})
+                df_o = pd.DataFrame(res); best = df_o.iloc[(df_o['p']-target).abs().argsort()[:1]].iloc[0]
+                st.success(f"✅ Valor ideal: **{fmt(best['v']) if 'Gasto' in opt_var else str(int(best['v']))+'%'}**")
