@@ -153,6 +153,12 @@ class InstrumentPosition:
     name: str
     value_clp: float
     rv_share: float
+    # Mandato / banda del fondo (aprox). Se usa para modelar "risk-off" del gestor en crisis.
+    rv_min: float = 0.0
+    rv_max: float = 1.0
+    # Liquidez operativa aproximada (dias habiles) para rescate / liquidacion.
+    liquidity_days: int = 3
+
     bucket: str = "BAL"  # RF_PURA | BAL | RV | AFP | PASIVO
     priority: int = 10   # menor = se vende antes
     include_withdrawals: bool = True
@@ -201,47 +207,60 @@ def parse_portfolio_json(json_str: str) -> pd.DataFrame:
 
 
 def default_instrument_meta() -> Dict[str, Dict[str, Any]]:
-    """Defaults basados en las fichas entregadas (cuando están disponibles) + heurísticas por id."""
+    """Defaults por instrumento.
+
+    - rv_share: % RV objetivo aproximado (0..1)
+    - rv_min / rv_max: banda plausible del mandato (para modelar "risk-off" en crisis)
+    - liquidity_days: dias habiles aproximados de rescate (para orden y UX)
+
+    OJO: esto es *config por defecto*; en la UI se puede editar.
+    """
     return {
-        # SURA Seguro de Vida
-        "SURA_SEGURO_MULTIACTIVO_AGRESIVO_SERIE_F": {"rv_share": 0.8913, "bucket": "RV", "priority": 20},
-        "SURA_SEGURO_MULTIACTIVO_MODERADO_SERIE_F": {"rv_share": 0.5452, "bucket": "BAL", "priority": 30},
-        "SURA_SEGURO_RENTA_LOCAL_UF_SERIE_F": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
-        "SURA_SEGURO_RENTA_BONOS_CHILE_SF": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
+        # --- SURA (Seguro de Vida) ---
+        "SURA_SEGURO_MULTIACTIVO_AGRESIVO_SERIE_F": {"rv_share": 0.8913, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 4, "bucket": "RV", "priority": 40},
+        "SURA_SEGURO_MULTIACTIVO_MODERADO_SERIE_F": {"rv_share": 0.5452, "rv_min": 0.30, "rv_max": 0.60, "liquidity_days": 4, "bucket": "BAL", "priority": 35},
+        "SURA_SEGURO_RENTA_LOCAL_UF_SERIE_F": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 0},
+        "SURA_SEGURO_RENTA_BONOS_CHILE_SF": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 0},
 
-        # BTG
-        "BTG_GESTION_AGRESIVA": {"rv_share": 0.6854, "bucket": "BAL", "priority": 35},
-        "BTG_GESTION_ACTIVA": {"rv_share": 0.3445, "bucket": "BAL", "priority": 25},
-        "BTG_GESTION_CONSERVADORA": {"rv_share": 0.1773, "bucket": "BAL", "priority": 15},
+        # --- BTG (Fondos Mutuos) ---
+        # Nota: estos rv_share vienen de la radiografia que compartiste (no del "mandato tipico"), por eso pueden ser <90%.
+        "BTG_GESTION_AGRESIVA": {"rv_share": 0.6854, "rv_min": 0.60, "rv_max": 0.90, "liquidity_days": 3, "bucket": "BAL", "priority": 45},
+        "BTG_GESTION_ACTIVA": {"rv_share": 0.3445, "rv_min": 0.20, "rv_max": 0.70, "liquidity_days": 3, "bucket": "BAL", "priority": 30},
+        "BTG_GESTION_CONSERVADORA": {"rv_share": 0.1773, "rv_min": 0.00, "rv_max": 0.30, "liquidity_days": 1, "bucket": "BAL", "priority": 15},
 
-        # Fondo inversión / crédito privado (tiene un componente menor de capital)
-        "MONEDA_RENTA_CLP": {"rv_share": 0.05, "bucket": "RF_PURA", "priority": 5},
+        # --- Fondo de inversión / crédito privado ---
+        "MONEDA_RENTA_CLP": {"rv_share": 0.05, "rv_min": 0.0, "rv_max": 0.15, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 5},
 
-        # DAP y caja
-        "DAP_CLP_10122025": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
-        "WISE_USD": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
-        "GLOBAL66_USD": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
+        # --- DAP y caja ---
+        "DAP_CLP_10122025": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 0, "bucket": "RF_PURA", "priority": 0},
+        "WISE_USD": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 0, "bucket": "RF_PURA", "priority": 0},
+        "GLOBAL66_USD": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 0, "bucket": "RF_PURA", "priority": 0},
 
-        # Offshore
-        "SURA_USD_SHORT_DURATION": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
-        "SURA_USD_MONEY_MARKET": {"rv_share": 0.0, "bucket": "RF_PURA", "priority": 0},
+        # --- Offshore (SURA) ---
+        "SURA_USD_SHORT_DURATION": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 5, "bucket": "RF_PURA", "priority": 2},
+        "SURA_USD_MONEY_MARKET": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 5, "bucket": "RF_PURA", "priority": 1},
 
-        # Previsional / AFP / APV (por defecto lo tratamos como "último a tocar")
-        "SURA_APV_MULTIACTIVO_AGRESIVO": {"rv_share": 0.8913, "bucket": "AFP", "priority": 60},
-        "SURA_DC_MULTIACTIVO_AGRESIVO": {"rv_share": 0.8913, "bucket": "AFP", "priority": 60},
-        "AFP_PLANVITAL_OBLIGATORIA": {"rv_share": 0.75, "bucket": "AFP", "priority": 70},
-        "AFP_PLANVITAL_AV_TRANSITORIO": {"rv_share": 0.75, "bucket": "AFP", "priority": 70},
-        "AFP_PLANVITAL_AV_OPCIONAL": {"rv_share": 0.75, "bucket": "AFP", "priority": 70},
-        "AFP_PLANVITAL_AV_RETIRO10": {"rv_share": 0.75, "bucket": "AFP", "priority": 70},
-        "AFP_PLANVITAL_AV_GENERAL": {"rv_share": 0.75, "bucket": "AFP", "priority": 70},
-        "AFP_PLANVITAL_AV_54BIS": {"rv_share": 0.75, "bucket": "AFP", "priority": 70},
+        # --- Previsional / AFP / APV ---
+        # Por defecto queda incluido como parte del patrimonio y *retirable*, pero en orden de venta queda al final.
+        "SURA_APV_MULTIACTIVO_AGRESIVO": {"rv_share": 0.8913, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 10, "bucket": "RV", "priority": 80},
+        "SURA_DC_MULTIACTIVO_AGRESIVO": {"rv_share": 0.8913, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 10, "bucket": "RV", "priority": 80},
+        "AFP_PLANVITAL_OBLIGATORIA": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
+        "AFP_PLANVITAL_AV_TRANSITORIO": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
+        "AFP_PLANVITAL_AV_OPCIONAL": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
+        "AFP_PLANVITAL_AV_RETIRO10": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
+        "AFP_PLANVITAL_AV_GENERAL": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
+        "AFP_PLANVITAL_AV_54BIS": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
     }
+
 
 
 def enrich_with_meta(df: pd.DataFrame) -> pd.DataFrame:
     meta = default_instrument_meta()
     out = df.copy()
     out["rv_share"] = 0.0
+    out["rv_min"] = 0.0
+    out["rv_max"] = 1.0
+    out["liquidity_days"] = 3
     out["bucket"] = "BAL"
     out["priority"] = 30
     out["include_withdrawals"] = True
@@ -257,6 +276,9 @@ def enrich_with_meta(df: pd.DataFrame) -> pd.DataFrame:
 
         if iid in meta:
             out.loc[i, "rv_share"] = float(meta[iid]["rv_share"])
+            out.loc[i, "rv_min"] = float(meta[iid].get("rv_min", 0.0))
+            out.loc[i, "rv_max"] = float(meta[iid].get("rv_max", 1.0))
+            out.loc[i, "liquidity_days"] = int(meta[iid].get("liquidity_days", 3))
             out.loc[i, "bucket"] = meta[iid]["bucket"]
             out.loc[i, "priority"] = int(meta[iid]["priority"])
         else:
@@ -264,19 +286,34 @@ def enrich_with_meta(df: pd.DataFrame) -> pd.DataFrame:
             name = str(r.get("name", "")).lower()
             if any(k in iid for k in ["USD_MONEY_MARKET", "SHORT_DURATION", "WISE", "GLOBAL66", "DAP"]):
                 out.loc[i, "rv_share"] = 0.0
+                out.loc[i, "rv_min"] = 0.0
+                out.loc[i, "rv_max"] = 0.0
+                out.loc[i, "liquidity_days"] = 0
                 out.loc[i, "bucket"] = "RF_PURA"
                 out.loc[i, "priority"] = 0
             elif "renta" in name and "bonos" in name:
                 out.loc[i, "rv_share"] = 0.0
+                out.loc[i, "rv_min"] = 0.0
+                out.loc[i, "rv_max"] = 0.0
+                out.loc[i, "liquidity_days"] = 3
                 out.loc[i, "bucket"] = "RF_PURA"
                 out.loc[i, "priority"] = 0
             else:
                 out.loc[i, "rv_share"] = 0.30
+                out.loc[i, "rv_min"] = 0.0
+                out.loc[i, "rv_max"] = 0.6
+                out.loc[i, "liquidity_days"] = 3
                 out.loc[i, "bucket"] = "BAL"
                 out.loc[i, "priority"] = 30
 
-    # clamp
-    out["rv_share"] = out["rv_share"].clip(0.0, 1.0)
+    # clamp + consistencia
+    out["rv_min"] = pd.to_numeric(out["rv_min"], errors="coerce").fillna(0.0).clip(0.0, 1.0)
+    out["rv_max"] = pd.to_numeric(out["rv_max"], errors="coerce").fillna(1.0).clip(0.0, 1.0)
+    # Asegura rv_min <= rv_max
+    out["rv_max"] = out[["rv_min", "rv_max"]].max(axis=1)
+    out["rv_share"] = pd.to_numeric(out["rv_share"], errors="coerce").fillna(0.0)
+    out["rv_share"] = out.apply(lambda r: min(max(float(r["rv_share"]), float(r["rv_min"])), float(r["rv_max"])), axis=1)
+    out["liquidity_days"] = pd.to_numeric(out["liquidity_days"], errors="coerce").fillna(3).astype(int)
     out["value_clp"] = pd.to_numeric(out["value_clp"], errors="coerce").fillna(0.0)
     return out
 
@@ -320,6 +357,7 @@ class PortfolioSimulator:
             return (
                 self.rules.bucket_order.get(p.bucket, 50),
                 int(p.priority),
+                int(getattr(p, 'liquidity_days', 3)),
                 float(p.rv_share),
                 p.instrument_id,
             )
@@ -327,18 +365,19 @@ class PortfolioSimulator:
         return sorted(idxs, key=lambda i: k(self.positions[i]))
 
     def _pick_rf_sink(self) -> Optional[int]:
-        # Prefer cash-like RF instrument as refill sink
+        # A donde "cae" el rebalanceo anual hacia RF pura.
+        # Preferimos el instrumento RF mas liquido (menos dias) y con menor prioridad.
         candidates = [i for i, p in enumerate(self.positions) if p.bucket == "RF_PURA" and p.include_withdrawals]
         if not candidates:
             return None
-        def liq_score(p: InstrumentPosition):
-            iid = p.instrument_id
-            if any(k in iid for k in ["WISE", "GLOBAL66", "USD_MONEY_MARKET"]):
-                return 0
-            if "DAP" in iid:
-                return 1
-            return 2
-        return sorted(candidates, key=lambda i: liq_score(self.positions[i]))[0]
+        return sorted(
+            candidates,
+            key=lambda i: (
+                int(getattr(self.positions[i], 'liquidity_days', 3)),
+                int(self.positions[i].priority),
+                self.positions[i].instrument_id,
+            ),
+        )[0]
 
     def run(self):
         n_sims, n_steps = self.cfg.n_sims, self.total_steps
@@ -408,10 +447,21 @@ class PortfolioSimulator:
             for j, p in enumerate(self.positions):
                 if p.bucket == "PASIVO":
                     continue
-                rv_eff = float(p.rv_share)
+
+                # Exposición objetivo
+                rv_base = float(p.rv_share)
+                rv_min = float(getattr(p, "rv_min", 0.0))
+                rv_max = float(getattr(p, "rv_max", 1.0))
+
+                # En crisis, el gestor puede bajar la exposición a RV dentro de su banda (aprox).
+                rv_eff = np.full(n_sims, rv_base, dtype=float)
                 if self.rules.manager_riskoff_in_crisis > 0 and p.bucket in ("BAL", "RV", "AFP"):
-                    # Simple approximation: in crisis, a manager reduces equity exposure.
-                    rv_eff = max(0.0, rv_eff * (1 - 0.25 * self.rules.manager_riskoff_in_crisis))
+                    crisis = (regime > 0) & alive
+                    if np.any(crisis):
+                        target = rv_base - float(self.rules.manager_riskoff_in_crisis) * (rv_base - rv_min)
+                        target = min(max(target, rv_min), rv_max)
+                        rv_eff[crisis] = target
+
                 v = values[:, j]
                 v_rv = v * rv_eff
                 v_rf = v * (1 - rv_eff)
@@ -517,6 +567,7 @@ def app(
     portfolio_df: Optional[pd.DataFrame] = None,
     macro_data: Optional[Dict[str, Any]] = None,
     portfolio_json: Optional[str] = None,
+    **_ignored_kwargs,
 ):
     st.markdown("## 🦅 Panel de Decisión Patrimonial")
     
@@ -580,15 +631,15 @@ def app(
                 if txt.strip():
                     st.session_state["portfolio_json"] = txt
                     try:
-                        df_src = _parse_portfolio_json(txt)
+                        df_src = parse_portfolio_json(txt)
                     except Exception as e:
                         st.error(f"No pude parsear el JSON: {e}")
 
             if df_src is None or (hasattr(df_src, "empty") and df_src.empty):
                 st.warning("No hay datos de cartera para simular en modo instrumentos.")
             else:
-                df_base = _normalize_instrument_df(df_src)
-                df_base = _apply_meta_defaults(df_base)
+                df_base = _normalize_portfolio_df(df_src)
+                df_base = enrich_with_meta(df_base)
 
                 edited = st.data_editor(
                     df_base,
@@ -600,6 +651,7 @@ def app(
                         "include_withdrawals": st.column_config.CheckboxColumn("Retirable"),
                         "bucket": st.column_config.SelectboxColumn("Bucket", options=["RF_PURA", "BAL", "RV", "AFP", "PASIVO"]),
                     },
+                    disabled=["instrument_id", "name", "rv_min", "rv_max", "liquidity_days"],
                     key="portfolio_editor",
                 )
 
@@ -615,13 +667,23 @@ def app(
                 with m2: st.metric("Motor (RV) estimado", f"{rv_pct:.1f}%")
                 with m3: st.metric("RF pura hoy", f"${fmt(rf_pura_amt)}")
 
-                rr1, rr2, rr3 = st.columns(3)
+                rr1, rr2, rr3, rr4 = st.columns(4)
                 with rr1:
                     rules.rf_reserve_years = st.slider("Reserva RF pura (años)", 0.0, 6.0, 3.5, 0.5)
                 with rr2:
-                    rules.rebalance_annually = st.checkbox("Rebalance anual RF pura", value=True)
+                    reb = st.checkbox("Rebalance anual RF pura", value=True)
+                    rules.rebalance_every_months = 12 if reb else 0
                 with rr3:
                     rules.rebalance_only_when_normal = st.checkbox("Rebalance solo si NO hay crisis", value=True)
+                with rr4:
+                    rules.manager_riskoff_in_crisis = st.slider(
+                        "Gestor defensivo en crisis (0-1)",
+                        0.0,
+                        1.0,
+                        float(rules.manager_riskoff_in_crisis),
+                        0.05,
+                        help="Si subes esto, los balanceados reducen su %RV efectivo en crisis dentro de su banda RV min/max. Útil si crees que el gestor rota a bonos cuando se pone feo.",
+                    )
 
                 positions = []
                 for _, r in edited.iterrows():
@@ -631,6 +693,9 @@ def app(
                             name=str(r["name"]),
                             value_clp=float(r["value_clp"]),
                             rv_share=float(r["rv_share"]),
+                            rv_min=float(r.get("rv_min", 0.0)),
+                            rv_max=float(r.get("rv_max", 1.0)),
+                            liquidity_days=int(r.get("liquidity_days", 3)),
                             bucket=str(r["bucket"]),
                             priority=int(r["priority"]),
                             include_withdrawals=bool(r["include_withdrawals"]),

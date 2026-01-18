@@ -3,6 +3,7 @@ import json
 import os
 import pandas as pd
 import simulador 
+import inspect
 
 st.set_page_config(page_title="Gestión Patrimonial", layout="wide", page_icon="🏦")
 
@@ -89,14 +90,22 @@ def render_simulador():
     total_defensa = saldo_rf + saldo_mx + saldo_usd_clp
     total_motor = d.get('rv', 0)
 
-    # LLAMADA AL MOTOR V7 (Argumentos corregidos)
-    simulador.app(
-        default_rf=total_defensa,      
-        default_rv=total_motor,        
-        default_inmo_neto=d.get('inmo_neto', 0),
-        portfolio_df=st.session_state.get("portfolio_df"),
-        macro_data=st.session_state.get("portfolio_macro")
-    )
+    # LLAMADA AL MOTOR (compatible con versiones antiguas de simulador.py)
+    sig = inspect.signature(simulador.app)
+    if "portfolio_df" in sig.parameters or "macro_data" in sig.parameters:
+        simulador.app(
+            default_rf=total_defensa,
+            default_rv=total_motor,
+            default_inmo_neto=d.get('inmo_neto', 0),
+            portfolio_df=st.session_state.get("portfolio_df"),
+            macro_data=st.session_state.get("portfolio_macro")
+        )
+    else:
+        simulador.app(
+            default_rf=total_defensa,
+            default_rv=total_motor,
+            default_inmo_neto=d.get('inmo_neto', 0)
+        )
 
 if st.session_state.vista_actual == 'HOME': render_home()
 elif st.session_state.vista_actual == 'SIMULADOR': render_simulador()
