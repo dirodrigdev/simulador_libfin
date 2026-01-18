@@ -215,26 +215,25 @@ def default_instrument_meta() -> Dict[str, Dict[str, Any]]:
 
     OJO: esto es *config por defecto*; en la UI se puede editar.
     """
+    # Default meta alineado a tu GEM (mandatos/rangos + liquidez operativa).
+    # Nota: estos valores son aproximados y *editables* en la tabla del modo Cartera Real.
     return {
         # --- SURA (Seguro de Vida) ---
-        # Mandato oficial: instrumentos de capitalización min 60% / max 100% (ver ficha).
-        "SURA_SEGURO_MULTIACTIVO_AGRESIVO_SERIE_F": {"rv_share": 0.8913, "rv_min": 0.60, "rv_max": 1.00, "liquidity_days": 4, "bucket": "RV", "priority": 40},
-        "SURA_SEGURO_MULTIACTIVO_MODERADO_SERIE_F": {"rv_share": 0.5452, "rv_min": 0.30, "rv_max": 0.60, "liquidity_days": 4, "bucket": "BAL", "priority": 35},
+        # GEM: Agresivo ~85-90% RV (80-100% banda), Moderado ~45-50% (30-60%), RF pura 0%.
+        "SURA_SEGURO_MULTIACTIVO_AGRESIVO_SERIE_F": {"rv_share": 0.875, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 4, "bucket": "RV", "priority": 40},
+        "SURA_SEGURO_MULTIACTIVO_MODERADO_SERIE_F": {"rv_share": 0.475, "rv_min": 0.30, "rv_max": 0.60, "liquidity_days": 4, "bucket": "BAL", "priority": 35},
         "SURA_SEGURO_RENTA_LOCAL_UF_SERIE_F": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 0},
         "SURA_SEGURO_RENTA_BONOS_CHILE_SF": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 0},
 
         # --- BTG (Fondos Mutuos) ---
-        # RV estimada desde la "Distribución por Clase de Activo" de cada ficha.
-        # - Gestión Agresiva: RV Int + RV Nac ≈ 68.54%. Mandato: capitalización 0..90%.
-        "BTG_GESTION_AGRESIVA": {"rv_share": 0.6854, "rv_min": 0.00, "rv_max": 0.90, "liquidity_days": 2, "bucket": "BAL", "priority": 45},
-        # - Gestión Activa: RV Int + RV Nac ≈ 38.65% (según ficha). Banda exacta del mandato no aparece en el extracto, se deja amplia.
-        "BTG_GESTION_ACTIVA": {"rv_share": 0.3865, "rv_min": 0.00, "rv_max": 0.90, "liquidity_days": 2, "bucket": "BAL", "priority": 30},
-        # - Gestión Conservadora: por mandato deuda >=80% => RV <=20%. RV actual ≈ 17.73%.
-        "BTG_GESTION_CONSERVADORA": {"rv_share": 0.1773, "rv_min": 0.00, "rv_max": 0.20, "liquidity_days": 1, "bucket": "BAL", "priority": 15},
+        # GEM: Agresiva ~95-100% (90-100% banda), Activa ~80-90% (70-100% banda), Conservadora ~15-20% (0-30% banda).
+        "BTG_GESTION_AGRESIVA": {"rv_share": 0.975, "rv_min": 0.90, "rv_max": 1.00, "liquidity_days": 2, "bucket": "RV", "priority": 55},
+        "BTG_GESTION_ACTIVA": {"rv_share": 0.85, "rv_min": 0.70, "rv_max": 1.00, "liquidity_days": 2, "bucket": "BAL", "priority": 30},
+        "BTG_GESTION_CONSERVADORA": {"rv_share": 0.175, "rv_min": 0.00, "rv_max": 0.30, "liquidity_days": 1, "bucket": "BAL", "priority": 15},
 
         # --- Fondo de inversión / crédito privado ---
         # Moneda Renta CLP (fondo de inversión): acciones ~2.9% (resto deuda/alternativos)
-        "MONEDA_RENTA_CLP": {"rv_share": 0.029, "rv_min": 0.0, "rv_max": 0.10, "liquidity_days": 3, "bucket": "RF_PURA", "priority": 5},
+        "MONEDA_RENTA_CLP": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 1, "bucket": "RF_PURA", "priority": 0},
 
         # --- DAP y caja ---
         "DAP_CLP_10122025": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 0, "bucket": "RF_PURA", "priority": 0},
@@ -242,19 +241,20 @@ def default_instrument_meta() -> Dict[str, Dict[str, Any]]:
         "GLOBAL66_USD": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 0, "bucket": "RF_PURA", "priority": 0},
 
         # --- Offshore (SURA) ---
-        "SURA_USD_SHORT_DURATION": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 5, "bucket": "RF_PURA", "priority": 2},
-        "SURA_USD_MONEY_MARKET": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 5, "bucket": "RF_PURA", "priority": 1},
+        # GEM: Nivel 4 (T+5 a T+7). Usamos 6 como aproximación.
+        "SURA_USD_SHORT_DURATION": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 6, "bucket": "RF_PURA", "priority": 2},
+        "SURA_USD_MONEY_MARKET": {"rv_share": 0.0, "rv_min": 0.0, "rv_max": 0.0, "liquidity_days": 6, "bucket": "RF_PURA", "priority": 1},
 
         # --- Previsional / AFP / APV ---
-        # Por defecto queda incluido como parte del patrimonio y *retirable*, pero en orden de venta queda al final.
-        "SURA_APV_MULTIACTIVO_AGRESIVO": {"rv_share": 0.8913, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 10, "bucket": "RV", "priority": 80},
-        "SURA_DC_MULTIACTIVO_AGRESIVO": {"rv_share": 0.8913, "rv_min": 0.80, "rv_max": 1.00, "liquidity_days": 10, "bucket": "RV", "priority": 80},
-        "AFP_PLANVITAL_OBLIGATORIA": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
-        "AFP_PLANVITAL_AV_TRANSITORIO": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
-        "AFP_PLANVITAL_AV_OPCIONAL": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
-        "AFP_PLANVITAL_AV_RETIRO10": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
-        "AFP_PLANVITAL_AV_GENERAL": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
-        "AFP_PLANVITAL_AV_54BIS": {"rv_share": 0.75, "rv_min": 0.60, "rv_max": 0.85, "liquidity_days": 10, "bucket": "RV", "priority": 85},
+        # GEM: AFP/APV ~75-80% RV, fricción alta (T+10 aprox). Lo ponemos en bucket AFP para que quede *último*.
+        "SURA_APV_MULTIACTIVO_AGRESIVO": {"rv_share": 0.80, "rv_min": 0.70, "rv_max": 1.00, "liquidity_days": 10, "bucket": "AFP", "priority": 90},
+        "SURA_DC_MULTIACTIVO_AGRESIVO": {"rv_share": 0.80, "rv_min": 0.70, "rv_max": 1.00, "liquidity_days": 10, "bucket": "AFP", "priority": 90},
+        "AFP_PLANVITAL_OBLIGATORIA": {"rv_share": 0.78, "rv_min": 0.65, "rv_max": 0.85, "liquidity_days": 10, "bucket": "AFP", "priority": 95},
+        "AFP_PLANVITAL_AV_TRANSITORIO": {"rv_share": 0.78, "rv_min": 0.65, "rv_max": 0.85, "liquidity_days": 10, "bucket": "AFP", "priority": 95},
+        "AFP_PLANVITAL_AV_OPCIONAL": {"rv_share": 0.78, "rv_min": 0.65, "rv_max": 0.85, "liquidity_days": 10, "bucket": "AFP", "priority": 95},
+        "AFP_PLANVITAL_AV_RETIRO10": {"rv_share": 0.78, "rv_min": 0.65, "rv_max": 0.85, "liquidity_days": 10, "bucket": "AFP", "priority": 95},
+        "AFP_PLANVITAL_AV_GENERAL": {"rv_share": 0.78, "rv_min": 0.65, "rv_max": 0.85, "liquidity_days": 10, "bucket": "AFP", "priority": 95},
+        "AFP_PLANVITAL_AV_54BIS": {"rv_share": 0.78, "rv_min": 0.65, "rv_max": 0.85, "liquidity_days": 10, "bucket": "AFP", "priority": 95},
     }
 
 
@@ -289,6 +289,57 @@ def enrich_with_meta(df: pd.DataFrame) -> pd.DataFrame:
         else:
             # Heurística suave: cash / money market / bonos = RF
             name = str(r.get("name", "")).lower()
+            # 1) Casos "por nombre" (cuando el instrument_id cambia o viene incompleto)
+            if "selecci" in name and "global" in name:
+                # GEM: ~98-100% RV (90-100% banda), T+5
+                out.loc[i, "rv_share"] = 0.99
+                out.loc[i, "rv_min"] = 0.90
+                out.loc[i, "rv_max"] = 1.00
+                out.loc[i, "liquidity_days"] = 5
+                out.loc[i, "bucket"] = "RV"
+                out.loc[i, "priority"] = 60
+                continue
+            if "multiactivo" in name and "agres" in name:
+                out.loc[i, "rv_share"] = 0.875
+                out.loc[i, "rv_min"] = 0.80
+                out.loc[i, "rv_max"] = 1.00
+                out.loc[i, "liquidity_days"] = 4
+                out.loc[i, "bucket"] = "RV"
+                out.loc[i, "priority"] = 40
+                continue
+            if "multiactivo" in name and "moder" in name:
+                out.loc[i, "rv_share"] = 0.475
+                out.loc[i, "rv_min"] = 0.30
+                out.loc[i, "rv_max"] = 0.60
+                out.loc[i, "liquidity_days"] = 4
+                out.loc[i, "bucket"] = "BAL"
+                out.loc[i, "priority"] = 35
+                continue
+            if "gesti" in name and "agres" in name:
+                out.loc[i, "rv_share"] = 0.975
+                out.loc[i, "rv_min"] = 0.90
+                out.loc[i, "rv_max"] = 1.00
+                out.loc[i, "liquidity_days"] = 2
+                out.loc[i, "bucket"] = "RV"
+                out.loc[i, "priority"] = 55
+                continue
+            if "gesti" in name and "activa" in name:
+                out.loc[i, "rv_share"] = 0.85
+                out.loc[i, "rv_min"] = 0.70
+                out.loc[i, "rv_max"] = 1.00
+                out.loc[i, "liquidity_days"] = 2
+                out.loc[i, "bucket"] = "BAL"
+                out.loc[i, "priority"] = 30
+                continue
+            if "gesti" in name and "conserv" in name:
+                out.loc[i, "rv_share"] = 0.175
+                out.loc[i, "rv_min"] = 0.00
+                out.loc[i, "rv_max"] = 0.30
+                out.loc[i, "liquidity_days"] = 1
+                out.loc[i, "bucket"] = "BAL"
+                out.loc[i, "priority"] = 15
+                continue
+
             if any(k in iid for k in ["USD_MONEY_MARKET", "SHORT_DURATION", "WISE", "GLOBAL66", "DAP"]):
                 out.loc[i, "rv_share"] = 0.0
                 out.loc[i, "rv_min"] = 0.0
@@ -652,11 +703,14 @@ def app(
                     num_rows="fixed",
                     column_config={
                         "rv_share": st.column_config.NumberColumn("% RV (0-1)", min_value=0.0, max_value=1.0, step=0.01),
+                        "rv_min": st.column_config.NumberColumn("RV min (0-1)", min_value=0.0, max_value=1.0, step=0.01),
+                        "rv_max": st.column_config.NumberColumn("RV max (0-1)", min_value=0.0, max_value=1.0, step=0.01),
+                        "liquidity_days": st.column_config.NumberColumn("Liquidez (dias habiles)", min_value=0, max_value=30, step=1),
                         "priority": st.column_config.NumberColumn("Prioridad retiro", min_value=0, max_value=99, step=1),
                         "include_withdrawals": st.column_config.CheckboxColumn("Retirable"),
                         "bucket": st.column_config.SelectboxColumn("Bucket", options=["RF_PURA", "BAL", "RV", "AFP", "PASIVO"]),
                     },
-                    disabled=["instrument_id", "name", "rv_min", "rv_max", "liquidity_days"],
+                    disabled=["instrument_id", "name"],
                     key="portfolio_editor",
                 )
 
@@ -671,6 +725,15 @@ def app(
                 with m1: st.metric("Patrimonio (CLP)", f"${fmt(tot)}")
                 with m2: st.metric("Motor (RV) estimado", f"{rv_pct:.1f}%")
                 with m3: st.metric("RF pura hoy", f"${fmt(rf_pura_amt)}")
+
+                with st.expander("🚒 Plan de escape (ranking por liquidez)"):
+                    tmp = edited[["name", "bucket", "liquidity_days", "rv_share", "priority", "include_withdrawals", "value_clp"]].copy()
+                    tmp = tmp[tmp["include_withdrawals"]].sort_values(["liquidity_days", "bucket", "priority", "rv_share"], ascending=[True, True, True, True])
+                    st.dataframe(
+                        tmp,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
                 rr1, rr2, rr3, rr4 = st.columns(4)
                 with rr1:
