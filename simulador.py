@@ -744,37 +744,36 @@ def _deterministic_institutional(cfg: SimulationConfig, withdrawals, rv_weight: 
     return cap_path, cpi_path
 
 
-
 def _deterministic_portfolio(cfg: SimulationConfig, positions, rules: PortfolioRulesConfig, withdrawals):
     """Expected-path (no randomness, no crises) for portfolio-mode.
 
-    Nota: es un baseline de intuicion (no replica 1:1 todas las micro-reglas), pero respeta:
-    - RV/RF por instrumento (rv_share)
-    - Orden de retiros por bucket/prioridad/liquidez
-    - Refill anual de RF (rf_reserve_years)
+    Adaptado para trabajar con InstrumentPosition o dict-like positions (robusto).
     """
     dt = 1.0 / 12.0
     steps = int(cfg.horizon_years * 12)
     g_rv = float(np.exp(cfg.mu_normal_rv * dt))
     g_rf = float(np.exp(cfg.mu_normal_rf * dt))
 
-    # working copies
-    pos = [PortfolioPosition(**{k: getattr(p, k) for k in p.__dataclass_fields__}) for p in (positions or [])]
-    vals = np.array([float(p.value) for p in pos], dtype=float)
+    pos = positions or []
+    vals = np.array([float(getattr(p, "value_clp", getattr(p, "value", 0.0))) for p in pos], dtype=float)
 
     def bucket_order(b):
         return {'RF_PURA': 0, 'BAL': 1, 'RV': 2, 'AFP': 3, 'PASIVO': 99}.get(b, 50)
 
     def wd_key(i):
         p = pos[i]
-        return (bucket_order(p.bucket_sim), int(p.priority), int(p.liquidity_days), -float(p.rv_share))
+        bucket = getattr(p, "bucket", getattr(p, "bucket_sim", None))
+        return (bucket_order(bucket),
+                int(getattr(p, "priority", 50)),
+                int(getattr(p, "liquidity_days", 3)),
+                -float(getattr(p, "rv_share", 0.0)))
 
     def get_wd_indices():
-        idx = [i for i, p in enumerate(pos) if p.include_withdrawals and p.bucket_sim != 'PASIVO']
+        idx = [i for i, p in enumerate(pos) if getattr(p, "include_withdrawals", True) and (getattr(p, "bucket", getattr(p, "bucket_sim", None)) != 'PASIVO')]
         return sorted(idx, key=wd_key)
 
     wd_idx = get_wd_indices()
-    rf_idx = [i for i, p in enumerate(pos) if p.include_withdrawals and p.bucket_sim == 'RF_PURA']
+    rf_idx = [i for i, p in enumerate(pos) if getattr(p, "include_withdrawals", True) and (getattr(p, "bucket", getattr(p, "bucket_sim", None)) == 'RF_PURA')]
 
     cap_path = np.zeros(steps + 1)
     cpi_path = np.ones(steps + 1)
@@ -784,7 +783,7 @@ def _deterministic_portfolio(cfg: SimulationConfig, positions, rules: PortfolioR
     for t in range(steps):
         # crecimiento esperado por instrumento
         for i, p in enumerate(pos):
-            rv = float(max(0.0, min(1.0, p.rv_share)))
+            rv = float(max(0.0, min(1.0, getattr(p, "rv_share", 0.0))))
             vals[i] *= (rv * g_rv + (1.0 - rv) * g_rf)
 
         # inflacion esperada
@@ -823,9 +822,9 @@ def _deterministic_portfolio(cfg: SimulationConfig, positions, rules: PortfolioR
             if gap > 1e-6:
                 donors = []
                 for b in ['BAL', 'RV', 'AFP']:
-                    donors += [i for i, p in enumerate(pos) if p.include_withdrawals and p.bucket_sim == b]
+                    donors += [i for i, p in enumerate(pos) if getattr(p, "include_withdrawals", True) and getattr(p, "bucket", getattr(p, "bucket_sim", None)) == b]
                 # vender primero lo mas liquido / menos equity
-                donors = sorted(donors, key=lambda i: (int(pos[i].priority), int(pos[i].liquidity_days), float(pos[i].rv_share)))
+                donors = sorted(donors, key=lambda i: (int(getattr(pos[i], "priority", 50)), int(getattr(pos[i], "liquidity_days", 3)), float(getattr(pos[i], "rv_share", 0.0))))
 
                 for i in donors:
                     if gap <= 1e-9:
@@ -838,7 +837,7 @@ def _deterministic_portfolio(cfg: SimulationConfig, positions, rules: PortfolioR
                     if rf_idx:
                         vals[rf_idx[0]] += take
                     else:
-                        j = min(range(len(pos)), key=lambda k: int(pos[k].liquidity_days))
+                        j = min(range(len(pos)), key=lambda k: int(getattr(pos[k], "liquidity_days", 3)))
                         vals[j] += take
                     gap -= take
 
@@ -919,11 +918,11 @@ def app(
     **_ignored_kwargs,
 ):
     # --- Pre-init claves usadas en reruns (evita UnboundLocalError) ---
-    st.session_state.setdefault('extra_events', [])
+    st.session_state.setdefault('extra_events', [])  # lista de dicts serializables {"year":int,"amount":float,"name":str}
     st.session_state.setdefault('evy', 5)
-    st.session_state.setdefault('eva', fmt(0))
     st.session_state.setdefault('evt', 'Entrada')
     st.session_state.setdefault('use_portfolio', False)
+    # No inicializamos txt__*/num__* aquí: clean_input hará la inicialización namespaced cuando se invoque.
 
     # Defaults locales (evita variables no inicializadas al cambiar modo)
     positions: List[InstrumentPosition] = []
@@ -1071,37 +1070,21 @@ def app(
                 positions = []
 
                 if edited is not None:
-
                     for _, r in edited.iterrows():
-
                         positions.append(
-
                             InstrumentPosition(
-
                                 instrument_id=str(r["instrument_id"]),
-
                                 name=str(r["name"]),
-
                                 value_clp=float(r["value_clp"]),
-
                                 rv_share=float(r["rv_share"]),
-
                                 rv_min=float(r.get("rv_min", 0.0)),
-
                                 rv_max=float(r.get("rv_max", 1.0)),
-
                                 liquidity_days=int(r.get("liquidity_days", 3)),
-
                                 bucket=str(r["bucket"]),
-
                                 priority=int(r["priority"]),
-
                                 include_withdrawals=bool(r["include_withdrawals"]),
-
                             )
-
                         )
-
 
                 cap_val = int(round(tot))
                 rv_sl = rv_pct
@@ -1129,23 +1112,23 @@ def app(
             with ce3:
                 st.selectbox('Tipo', ['Entrada', 'Salida'], key='evt')
             with ce4:
-                if st.button('Add'):
+                if st.button('Add', key='add_extra'):
                     y = int(st.session_state.get('evy', 1))
-                    # clean_input devuelve int, pero guardamos el string formateado en session_state['eva']
-                    try:
-                        a = int(re.sub(r'\D', '', str(st.session_state.get('eva', '0'))))
-                    except Exception:
-                        a = 0
+                    a = int(st.session_state.get('num__eva', 0))
                     t = str(st.session_state.get('evt', 'Entrada'))
                     amt = a if t == 'Entrada' else -a
-                    st.session_state['extra_events'].append(ExtraCashflow(y, amt, 'Hito'))
+                    # Guardar dict serializable
+                    st.session_state['extra_events'].append({"year": int(y), "amount": float(amt), "name": "Hito"})
             for e in st.session_state['extra_events']:
-                st.text(f"Año {e.year}: ${fmt(e.amount)}")
-            if st.button('Limpiar'):
+                st.text(f"Año {int(e['year'])}: ${fmt(e['amount'])}")
+            if st.button('Limpiar', key='clear_extra'):
                 st.session_state['extra_events'] = []
 
         enable_p = st.checkbox("Venta Casa Emergencia", value=True)
         val_h = clean_input("Valor Neto Casa ($)", default_inmo_neto, "vi") if enable_p else 0
+
+        # Convertir extra_events (lista de dicts) a ExtraCashflow dataclass para la configuración
+        extra_events_objs = [ExtraCashflow(int(e["year"]), float(e["amount"]), e.get("name", "Hito")) for e in st.session_state.get("extra_events", [])]
 
         wds_current = _build_withdrawals(horiz, r1, d1, r2, d2, r3)
         cfg_current = SimulationConfig(
@@ -1157,13 +1140,13 @@ def app(
             net_inmo_value=val_h,
             mu_normal_rv=c_rv,
             mu_normal_rf=c_rf,
-            extra_cashflows=st.session_state.extra_events,
+            extra_cashflows=extra_events_objs,
             mu_global_rv=SC_GLO[sel_glo][0],
             mu_global_rf=SC_GLO[sel_glo][1],
             corr_global=SC_GLO[sel_glo][2],
         )
 
-        if st.button("🚀 INICIAR SIMULACIÓN", type="primary"):
+        if st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim"):
             wds = wds_current
             cfg = cfg_current
             if use_portfolio:
@@ -1289,7 +1272,7 @@ def app(
         with cC:
             st.caption("Tip: usa menos sims para iterar rápido, luego sube a 2000-3000")
 
-        if st.button("🧨 CORRER STRESS", type="primary"):
+        if st.button("🧨 CORRER STRESS", type="primary", key="run_stress"):
             # Build stress config from current inputs
             ovr = STRESS[scen]["ovr"].copy()
             cfg_st = replace(cfg_current, n_sims=int(stress_sims), random_seed=int(stress_seed), stress_schedule=sched, **ovr)
@@ -1355,7 +1338,7 @@ def app(
                 if use_portfolio:
                     # Baseline aproximado en modo cartera: usamos los %RV efectivos por instrumento y el orden de retiro
                     # (la idea es intuición, no precisión milimétrica)
-                    pos = [PortfolioPosition(**pp.__dict__) for pp in positions]  # copia
+                    pos = positions.copy() if positions else []
                     cap_det, cpi_det = _deterministic_portfolio(replace(cfg_current, enable_prop=False), positions, rules, wds_current)
                 else:
                     cap_det, cpi_det = _deterministic_institutional(cfg_current, wds_current, rv_weight=float(rv_sl)/100.0)
@@ -1611,7 +1594,7 @@ def app(
             st.subheader("🎯 Buscador de Soluciones Estratégicas")
             target = st.slider("Meta Éxito %", 70, 100, 95)
             opt_var = st.selectbox("Optimizar:", ["Mix RV %", "Gasto Fase 1", "Gasto Fase 2", "Gasto Fase 3"])
-            if st.button("🔍 CALCULAR ÓPTIMO"):
+            if st.button("🔍 CALCULAR ÓPTIMO", key="opt_run"):
                 res = []
                 with st.spinner("Ejecutando..."):
                     if "Mix" in opt_var:
@@ -1627,6 +1610,8 @@ def app(
                         tw2 = (v if opt_var == "Gasto Fase 2" else r2)
                         tw3 = (v if opt_var == "Gasto Fase 3" else r3)
                         w_t = [WithdrawalTramo(0, d1, tw1), WithdrawalTramo(d1, d1+d2, tw2), WithdrawalTramo(d1+d2, horiz, tw3)]
+                        # convert extra_events dicts -> ExtraCashflow
+                        extra_events_objs_opt = [ExtraCashflow(int(e["year"]), float(e["amount"]), e.get("name", "Hito")) for e in st.session_state.get("extra_events", [])]
                         c_t = SimulationConfig(
                             horizon_years=horiz,
                             initial_capital=cap_val,
@@ -1640,7 +1625,7 @@ def app(
                             mu_global_rv=SC_GLO[sel_glo][0],
                             mu_global_rf=SC_GLO[sel_glo][1],
                             corr_global=SC_GLO[sel_glo][2],
-                            extra_cashflows=st.session_state.extra_events,
+                            extra_cashflows=extra_events_objs_opt,
                         )
                         _, _, ri = InstitutionalSimulator(c_t, a_t, w_t).run()
                         res.append({"v": v, "p": (1-(np.sum(ri>-1)/400))*100})
