@@ -934,6 +934,7 @@ def app(
         horiz = st.slider("Horizonte", 10, 50, 40)
 
     tab_sim, tab_stress, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🧯 Stress", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
+    run_diag = False  # default: avoid NameError on reruns
 
     # Valores forzados para Diego
     tot_ini = default_rf + default_rv
@@ -1275,7 +1276,6 @@ def app(
                 "p90_terminal_real": float(np.percentile(terminal_real, 90)),
                 "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
             }
-    run_diag = False  # default to avoid NameError on reruns
     with tab_diag:
         st.subheader("Baseline determinístico + Sensibilidad (Tornado)")
         st.caption("Esto no reemplaza el Monte Carlo: te muestra el 'camino esperado' y qué variables te mueven más el éxito.")
