@@ -49,6 +49,7 @@ class SimulationConfig:
     corr_normal: float = 0.35
     t_df: int = 8
     random_seed: Optional[int] = None
+    stress_schedule: Optional[List[int]] = None
 
 # --- 3. MOTOR SOVEREIGN ---
 class InstitutionalSimulator:
@@ -87,18 +88,23 @@ class InstitutionalSimulator:
         for t in range(n_steps):
             alive = is_alive
             if not np.any(alive): break
-            # Markov regimes: ensure a crisis can't enter and exit in the same month.
-            reg_prev = regime.copy()
-            m0 = (reg_prev == 0) & alive
-            if np.any(m0):
-                r = self.rng.random(np.sum(m0))
-                idx = np.where(m0)[0]
-                regime[idx[r < self.p_norm_l]] = 1
-                regime[idx[(r >= self.p_norm_l) & (r < (self.p_norm_l + self.p_norm_g))]] = 2
-            mc = (reg_prev > 0) & alive
-            if np.any(mc):
-                idxc = np.where(mc)[0]
-                regime[idxc[self.rng.random(np.sum(mc)) < self.p_exit]] = 0
+            schedule = getattr(self.cfg, "stress_schedule", None)
+            if schedule is not None and isinstance(schedule, list) and len(schedule) >= n_steps:
+                # Stress mode: all sims share the same regime path (0=Normal,1=Local,2=Global)
+                regime[alive] = int(schedule[t])
+            else:
+                # Markov regimes: ensure a crisis can't enter and exit in the same month.
+                reg_prev = regime.copy()
+                m0 = (reg_prev == 0) & alive
+                if np.any(m0):
+                    r = self.rng.random(np.sum(m0))
+                    idx = np.where(m0)[0]
+                    regime[idx[r < self.p_norm_l]] = 1
+                    regime[idx[(r >= self.p_norm_l) & (r < (self.p_norm_l + self.p_norm_g))]] = 2
+                mc = (reg_prev > 0) & alive
+                if np.any(mc):
+                    idxc = np.where(mc)[0]
+                    regime[idxc[self.rng.random(np.sum(mc)) < self.p_exit]] = 0
 
             z_t = Z_raw[:, t, :]; z_f = np.zeros_like(z_t)
             for r_idx, L in enumerate(self.L_mats):
@@ -471,18 +477,23 @@ class PortfolioSimulator:
             if not np.any(alive):
                 break
 
-            # Markov (no enter+exit same month)
-            reg_prev = regime.copy()
-            m0 = (reg_prev == 0) & alive
-            if np.any(m0):
-                r = self.rng.random(np.sum(m0))
-                idx = np.where(m0)[0]
-                regime[idx[r < self.cfg.prob_enter_local]] = 1
-                regime[idx[(r >= self.cfg.prob_enter_local) & (r < (self.cfg.prob_enter_local + self.cfg.prob_enter_global))]] = 2
-            mc = (reg_prev > 0) & alive
-            if np.any(mc):
-                idxc = np.where(mc)[0]
-                regime[idxc[self.rng.random(np.sum(mc)) < self.cfg.prob_exit_crisis]] = 0
+            schedule = getattr(self.cfg, "stress_schedule", None)
+            if schedule is not None and isinstance(schedule, list) and len(schedule) >= n_steps:
+                # Stress mode: all sims share the same regime path (0=Normal,1=Local,2=Global)
+                regime[alive] = int(schedule[t])
+            else:
+                # Markov (no enter+exit same month)
+                reg_prev = regime.copy()
+                m0 = (reg_prev == 0) & alive
+                if np.any(m0):
+                    r = self.rng.random(np.sum(m0))
+                    idx = np.where(m0)[0]
+                    regime[idx[r < self.cfg.prob_enter_local]] = 1
+                    regime[idx[(r >= self.cfg.prob_enter_local) & (r < (self.cfg.prob_enter_local + self.cfg.prob_enter_global))]] = 2
+                mc = (reg_prev > 0) & alive
+                if np.any(mc):
+                    idxc = np.where(mc)[0]
+                    regime[idxc[self.rng.random(np.sum(mc)) < self.cfg.prob_exit_crisis]] = 0
 
             # Market step
             z_t = Z_raw[:, t, :]
@@ -922,7 +933,7 @@ def app(
         n_sims = st.slider("Simulaciones", 500, 3000, 1000)
         horiz = st.slider("Horizonte", 10, 50, 40)
 
-    tab_sim, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
+    tab_sim, tab_stress, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🧯 Stress", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
 
     # Valores forzados para Diego
     tot_ini = default_rf + default_rv
@@ -1135,6 +1146,128 @@ def app(
 
     
 
+
+
+    with tab_stress:
+        st.subheader("🧯 Stress Tests (5 escenarios)")
+        st.caption("Estos escenarios fuerzan una trayectoria de crisis (sin Markov) para medir robustez bajo shocks específicos. Mantienen el mismo motor (colas gordas + correlaciones).")
+
+        STRESS = {
+            "2008 Global + Aftershock Local": {
+                "desc": "18 meses de crisis global severa + 12 meses de crisis local (aftershock).",
+                "blocks": [(2, 18), (1, 12)],
+                "ovr": {"mu_global_rv": -0.28, "mu_global_rf": -0.04, "corr_global": 0.90, "mu_local_rv": -0.12, "mu_local_rf": 0.04, "corr_local": -0.15},
+            },
+            "COVID Flash Crash": {
+                "desc": "Shock global muy fuerte y corto (4 meses).",
+                "blocks": [(2, 4)],
+                "ovr": {"mu_global_rv": -0.35, "mu_global_rf": -0.06, "corr_global": 0.92},
+            },
+            "Chile Local Prolongada": {
+                "desc": "Crisis local prolongada (24 meses) con inflación más alta.",
+                "blocks": [(1, 24)],
+                "ovr": {"mu_local_rv": -0.14, "mu_local_rf": 0.02, "corr_local": -0.20, "inflation_mean": 0.060, "inflation_vol": 0.018},
+            },
+            "Doble Recesión (W)": {
+                "desc": "Dos shocks globales de 6 meses separados por 6 meses de calma.",
+                "blocks": [(2, 6), (0, 6), (2, 6)],
+                "ovr": {"mu_global_rv": -0.30, "mu_global_rf": -0.05, "corr_global": 0.90},
+            },
+            "Secuencia Mala (3y local + remate global)": {
+                "desc": "36 meses de crisis local (drawdown gradual) + 6 meses global al final.",
+                "blocks": [(1, 36), (2, 6)],
+                "ovr": {"mu_local_rv": -0.10, "mu_local_rf": 0.03, "corr_local": -0.15, "mu_global_rv": -0.22, "mu_global_rf": -0.04, "corr_global": 0.85},
+            },
+        }
+
+        scen = st.selectbox("Escenario", list(STRESS.keys()), index=0)
+        st.info(STRESS[scen]["desc"])
+
+        # Timeline preview
+        n_steps_preview = int(horiz * 12)
+        def build_schedule(blocks, n_steps):
+            sched = [0] * n_steps
+            i = 0
+            for reg, months in blocks:
+                for _ in range(int(months)):
+                    if i >= n_steps:
+                        break
+                    sched[i] = int(reg)
+                    i += 1
+            return sched
+
+        sched = build_schedule(STRESS[scen]["blocks"], n_steps_preview)
+        # Simple chart: regime by month
+        x = np.arange(n_steps_preview) / 12.0
+        fig_s = go.Figure()
+        fig_s.add_trace(go.Scatter(x=x, y=sched, mode='lines', name='Régimen (0/1/2)'))
+        fig_s.update_layout(
+            title="Trayectoria forzada de régimen (0=Normal,1=Local,2=Global)",
+            template="plotly_dark",
+            yaxis=dict(tickmode='array', tickvals=[0,1,2], ticktext=['Normal','Local','Global']),
+            xaxis_title="Años",
+        )
+        st.plotly_chart(fig_s, use_container_width=True)
+
+        cA, cB, cC = st.columns(3)
+        with cA:
+            stress_sims = st.slider("Simulaciones (stress)", 200, 3000, min(1000, int(n_sims)), step=100)
+        with cB:
+            stress_seed = st.number_input("Seed", value=12345, step=1)
+        with cC:
+            st.caption("Tip: usa menos sims para iterar rápido, luego sube a 2000-3000")
+
+        if st.button("🧨 CORRER STRESS", type="primary"):
+            # Build stress config from current inputs
+            ovr = STRESS[scen]["ovr"].copy()
+            cfg_st = replace(cfg_current, n_sims=int(stress_sims), random_seed=int(stress_seed), stress_schedule=sched, **ovr)
+
+            wds = wds_current
+            if use_portfolio:
+                if not portfolio_ready:
+                    st.error("Modo instrumentos activo, pero no hay cartera válida (o no hay nada marcado como retirable).")
+                    st.stop()
+                sim = PortfolioSimulator(cfg_st, positions, wds, rules)
+                paths, cpi, r_i = sim.run()
+            else:
+                assets = [AssetBucket("RV", float(rv_sl)/100), AssetBucket("RF", (100-float(rv_sl))/100, True)]
+                sim = InstitutionalSimulator(cfg_st, assets, wds)
+                paths, cpi, r_i = sim.run()
+
+            prob = (1 - (np.sum(r_i > -1)/cfg_st.n_sims))*100
+            terminal_real = paths[:, -1] / np.maximum(cpi[:, -1], 1e-9)
+            ruined = (r_i > -1)
+            ruin_years = (r_i[ruined] / 12.0) if np.any(ruined) else np.array([])
+
+            m1, m2, m3, m4 = st.columns(4)
+            with m1: st.metric("Éxito", f"{prob:.1f}%")
+            with m2: st.metric("Mediana legado real", f"${fmt(np.median(terminal_real))}")
+            with m3: st.metric("P10 legado real", f"${fmt(np.percentile(terminal_real, 10))}")
+            with m4: st.metric("Año mediano de ruina", f"{np.median(ruin_years):.1f}" if ruin_years.size else "—")
+
+            y_ax = np.arange(paths.shape[1]) / 12.0
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=np.concatenate([y_ax, y_ax[::-1]]),
+                y=np.concatenate([np.percentile(paths, 90, 0), np.percentile(paths, 10, 0)[::-1]]),
+                fill='toself',
+                fillcolor='rgba(239,68,68,0.20)',
+                line=dict(color='rgba(0,0,0,0)'),
+                name='Rango 80%'
+            ))
+            fig.add_trace(go.Scatter(x=y_ax, y=np.percentile(paths, 50, 0), line=dict(color='rgba(239,68,68,1.0)', width=3), name='Mediana'))
+            fig.update_layout(title=f"Stress: {scen} (Nominal)", template="plotly_dark")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.session_state["last_stress"] = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "scenario": scen,
+                "success_pct": float(prob),
+                "median_terminal_real": float(np.median(terminal_real)),
+                "p10_terminal_real": float(np.percentile(terminal_real, 10)),
+                "p90_terminal_real": float(np.percentile(terminal_real, 90)),
+                "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
+            }
     with tab_diag:
         st.subheader("Baseline determinístico + Sensibilidad (Tornado)")
         st.caption("Esto no reemplaza el Monte Carlo: te muestra el 'camino esperado' y qué variables te mueven más el éxito.")
