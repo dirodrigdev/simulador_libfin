@@ -944,6 +944,8 @@ def app(
         positions: List[InstrumentPosition] = []
         rules = PortfolioRulesConfig()
         portfolio_ready = False
+        # Evita UnboundLocalError en reruns: 'edited' solo existe cuando hay DF válido y se renderiza el editor.
+        edited = None
 
         # Defaults (avoid UnboundLocalError when portfolio data is missing)
         cap_val = tot_ini
@@ -953,9 +955,6 @@ def app(
         if use_portfolio:
             st.subheader("📦 Cartera Real (Instrumentos)")
             st.caption("Edita el % RV de cada instrumento y su prioridad de retiro. Por defecto: RF pura primero → luego balanceados → lo más RV al final.")
-
-            # Safety: Streamlit reruns + conditional branches can otherwise leave locals undefined.
-            edited = None
 
             src = st.radio(
                 "Fuente de cartera",
@@ -1039,27 +1038,27 @@ def app(
                         0.05,
                         help="Si subes esto, los balanceados reducen su %RV efectivo en crisis dentro de su banda RV min/max. Útil si crees que el gestor rota a bonos cuando se pone feo.",
                     )
-                # Build positions safely (avoid UnboundLocalError on reruns / empty data).
+
                 positions = []
-                if edited is None or (hasattr(edited, 'empty') and edited.empty):
-                    st.warning("No hay cartera editable disponible (falta data o hubo error al cargar).")
-                    portfolio_ready = False
-                else:
+                if edited is not None:
                     for _, r in edited.iterrows():
                         positions.append(
                             InstrumentPosition(
-                                instrument_id=str(r['instrument_id']),
-                                name=str(r['name']),
-                                value_clp=float(r['value_clp']),
-                                rv_share=float(r['rv_share']),
-                                rv_min=float(r.get('rv_min', 0.0)),
-                                rv_max=float(r.get('rv_max', 1.0)),
-                                liquidity_days=int(r.get('liquidity_days', 3)),
-                                bucket=str(r['bucket']),
-                                priority=int(r['priority']),
-                                include_withdrawals=bool(r['include_withdrawals']),
+                                instrument_id=str(r["instrument_id"]),
+                                name=str(r["name"]),
+                                value_clp=float(r["value_clp"]),
+                                rv_share=float(r["rv_share"]),
+                                rv_min=float(r.get("rv_min", 0.0)),
+                                rv_max=float(r.get("rv_max", 1.0)),
+                                liquidity_days=int(r.get("liquidity_days", 3)),
+                                bucket=str(r["bucket"]),
+                                priority=int(r["priority"]),
+                                include_withdrawals=bool(r["include_withdrawals"]),
                             )
                         )
+
+                # Si no hubo editor (por DF inválido), no toques cap_val/rv_sl para no romper el resto de la UI.
+                if edited is not None:
                     cap_val = int(round(tot))
                     rv_sl = rv_pct
                     portfolio_ready = cap_val > 0 and any(p.include_withdrawals for p in positions)
