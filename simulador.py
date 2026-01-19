@@ -85,6 +85,89 @@ def aggregate_success_score(scores: Dict[str, Optional[float]], weights: Dict[st
         return None
     return sum(float(weights.get(k, 0.0)) * float(usable[k]) for k in usable.keys()) / weight_sum
 
+def render_score_bar(scores: Dict[str, Optional[float]], weights: Dict[str, float]) -> None:
+    agg_score = aggregate_success_score(scores, weights)
+    def fmt_pct(val: Optional[float]) -> str:
+        return f"{val:.1f}%" if val is not None else "—"
+
+    st.markdown(
+        """
+        <style>
+        .score-hero {
+            position: sticky;
+            top: 0.5rem;
+            z-index: 99;
+            padding: 16px 18px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, rgba(15,23,42,0.95), rgba(30,41,59,0.95));
+            border: 1px solid rgba(148,163,184,0.25);
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.35);
+            margin-bottom: 16px;
+        }
+        .score-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .score-card {
+            background: rgba(2, 6, 23, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 12px;
+            padding: 12px 14px;
+        }
+        .score-card h4 {
+            margin: 0 0 6px 0;
+            font-size: 0.85rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .score-card p {
+            margin: 0;
+            font-size: 1.6rem;
+            color: #f8fafc;
+            font-weight: 600;
+        }
+        .score-meta {
+            margin-top: 10px;
+            color: #94a3b8;
+            font-size: 0.85rem;
+        }
+        @media (max-width: 1200px) {
+            .score-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+        <div class="score-hero">
+            <div class="score-grid">
+                <div class="score-card">
+                    <h4>Indicador agregado</h4>
+                    <p>{fmt_pct(agg_score)}</p>
+                </div>
+                <div class="score-card">
+                    <h4>Monte Carlo</h4>
+                    <p>{fmt_pct(scores.get("mc"))}</p>
+                </div>
+                <div class="score-card">
+                    <h4>Stress</h4>
+                    <p>{fmt_pct(scores.get("stress"))}</p>
+                </div>
+                <div class="score-card">
+                    <h4>Tornado</h4>
+                    <p>{fmt_pct(scores.get("tornado"))}</p>
+                </div>
+            </div>
+            <div class="score-meta">Pesos configurables en el sidebar · MC {weights.get("mc", 0):.0%} · Stress {weights.get("stress", 0):.0%} · Tornado {weights.get("tornado", 0):.0%}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # ----------------------
 # Dataclasses / Config
 # ----------------------
@@ -650,240 +733,252 @@ def app():
     # ----------------------
     with tab_sim:
         st.subheader("Simulación principal")
+        col_inputs, col_results = st.columns([0.45, 0.55], gap="large")
         use_portfolio = st.session_state.get("use_portfolio", False)
-        portfolio_df = None
         positions: List[InstrumentPosition] = []
 
-        if use_portfolio:
-            st.info("Modo Cartera Real: pega el JSON de instrumentos o usa el Dashboard")
-            txt = st.text_area("Pega JSON cartera (registros → instrumentos)", value=st.session_state.get("portfolio_json", ""), height=180)
-            if txt.strip():
-                st.session_state["portfolio_json"] = txt
+        with col_inputs:
+            st.markdown("### 1) Datos base")
+            if use_portfolio:
+                st.info("Modo Cartera Real: pega el JSON de instrumentos o usa el Dashboard")
+                txt = st.text_area("Pega JSON cartera (registros → instrumentos)", value=st.session_state.get("portfolio_json", ""), height=180)
+                if txt.strip():
+                    st.session_state["portfolio_json"] = txt
+                    try:
+                        df_src = parse_portfolio_json(txt)
+                        df_base = enrich_with_meta(df_src)
+                        edited = df_base
+                        tot = float(edited["value_clp"].sum())
+                        rv_amt = float((edited["value_clp"] * edited["rv_share"]).sum())
+                        rf_pura_amt = float(edited.loc[edited["bucket"] == "RF_PURA", "value_clp"].sum())
+                        c1, c2, c3 = st.columns(3)
+                        with c1:
+                            st.metric("Patrimonio (CLP)", f"${fmt(tot)}")
+                        with c2:
+                            st.metric("Motor (RV) estimado", f"{(100.0 * rv_amt / tot) if tot>0 else 0:.1f}%")
+                        with c3:
+                            st.metric("RF pura hoy", f"${fmt(rf_pura_amt)}")
+                        for _, r in edited.iterrows():
+                            positions.append(InstrumentPosition(
+                                instrument_id=str(r["instrument_id"]),
+                                name=str(r["name"]),
+                                value_clp=float(r["value_clp"]),
+                                rv_share=float(r.get("rv_share", 0.0)),
+                                rv_min=float(r.get("rv_min", 0.0)),
+                                rv_max=float(r.get("rv_max", 1.0)),
+                                liquidity_days=int(r.get("liquidity_days", 3)),
+                                bucket=str(r.get("bucket", "BAL")),
+                                priority=int(r.get("priority", 30)),
+                                include_withdrawals=bool(r.get("include_withdrawals", True)),
+                            ))
+                    except Exception as e:
+                        st.error(f"No pude parsear JSON: {e}")
+            else:
+                st.info("Modo agregado: valores por defecto aplicados si no cambias nada.")
+                cap_val = clean_input("Capital Total ($)", 1800000000, "cap")
+                st.caption(f"Patrimonio usado por defecto: ${fmt(st.session_state.get('num__cap', 1800000000))}")
+                rv_pct = st.slider("Motor (RV %)", 0, 100, 60, key="rv_pct_main")
+                st.metric("Reserva RF (estimada)", f"${fmt(int(cap_val * (1 - rv_pct/100)))}")
+
+            st.markdown("### 2) Perfil de gastos (mes)")
+            cols = st.columns(3)
+            with cols[0]:
+                r1 = clean_input("Gasto F1 (CLP/mes)", 6000000, "r1")
+                d1 = st.number_input("Años F1", 0, 40, 7, key="d1")
+            with cols[1]:
+                r2 = clean_input("Gasto F2 (CLP/mes)", 5000000, "r2")
+                d2 = st.number_input("Años F2", 0, 40, 13, key="d2")
+            with cols[2]:
+                r3 = clean_input("Gasto F3 (CLP/mes)", 4000000, "r3")
+                d3 = st.number_input("Años F3", 0, 40, 20, key="d3")
+
+            wds = [
+                WithdrawalTramo(0, int(d1), int(r1)),
+                WithdrawalTramo(int(d1), int(d1 + d2), int(r2)),
+                WithdrawalTramo(int(d1 + d2), int(d1 + d2 + d3), int(r3)),
+            ]
+
+            with st.expander("💸 Inyecciones o Salidas"):
+                st.session_state.setdefault('extra_events', [])
+                ce1, ce2, ce3, ce4 = st.columns([1, 2, 2, 1])
+                with ce1:
+                    st.number_input('Año', 1, 40, int(st.session_state.get('evy', 5)), key='evy')
+                with ce2:
+                    clean_input('Monto ($)', 0, 'eva')
+                with ce3:
+                    st.selectbox('Tipo', ['Entrada', 'Salida'], key='evt')
+                with ce4:
+                    if st.button('Add', key='add_extra'):
+                        y = int(st.session_state.get('evy', 1))
+                        a = int(st.session_state.get('num__eva', 0))
+                        t = str(st.session_state.get('evt', 'Entrada'))
+                        amt = a if t == 'Entrada' else -a
+                        st.session_state['extra_events'].append({"year": int(y), "amount": float(amt), "name": "Hito"})
+                for e in st.session_state['extra_events']:
+                    st.text(f"Año {int(e['year'])}: ${fmt(e['amount'])}")
+                if st.button('Limpiar', key='clear_extra'):
+                    st.session_state['extra_events'] = []
+
+            st.markdown("### 3) Reglas de contingencia")
+            enable_p = st.checkbox("Venta Casa Emergencia", value=True, key="enable_prop")
+            val_h = clean_input("Valor Neto Casa ($)", 500000000, "vi") if enable_p else 0
+
+            adv = st.session_state.get('advanced', {})
+            mu_rv_cont = to_continuous_mu(c_rv_in if 'c_rv_in' in locals() else 0.11)
+            mu_rf_cont = to_continuous_mu(c_rf_in if 'c_rf_in' in locals() else 0.06)
+
+            cfg_current = SimulationConfig(
+                horizon_years=int(horiz),
+                initial_capital=int(st.session_state.get('num__cap', 1800000000)),
+                n_sims=int(st.session_state.get('n_sims_main', 2000)),
+                is_active_managed=bool(st.session_state.get('is_active_cb', True)),
+                enable_prop=bool(st.session_state.get('enable_prop', True)),
+                net_inmo_value=float(st.session_state.get('num__vi', 500000000)),
+                mu_normal_rv=mu_rv_cont,
+                mu_normal_rf=mu_rf_cont,
+                extra_cashflows=[ExtraCashflow(int(e["year"]), float(e["amount"]), e.get("name", "Hito")) for e in st.session_state.get("extra_events", [])],
+                mu_global_rv=-0.22,
+                mu_global_rf=-0.02,
+                corr_global=0.75,
+                corr_normal=float(adv.get('corr_normal', 0.35)),
+                p_def=float(adv.get('p_def', 1.0)),
+                vol_factor_active=float(adv.get('vol_factor_active', 0.80)),
+                sale_cost_pct=float(adv.get('sale_cost_pct', 0.02)),
+                sale_delay_months=int(adv.get('sale_delay_months', 3)),
+                pct_discretionary=float(adv.get('pct_discretionary', 0.20)),
+                discretionary_cut_in_crisis=float(adv.get('discretionary_cut_in_crisis', 0.60)),
+                rf_reserve_years=float(adv.get('rf_reserve_years', 3.5)),
+                t_df=int(8),
+                random_seed=12345,
+            )
+
+            st.markdown("### 4) Ejecución rápida")
+            auto_models = st.checkbox("Ejecutar Stress/Tornado automáticamente (rápido)", value=True, key="auto_models")
+            run_sim = st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim")
+
+        with col_results:
+            last_run = st.session_state.get("last_run")
+            last_stress = st.session_state.get("last_stress")
+            last_tornado = st.session_state.get("last_tornado")
+            weights = st.session_state.get("score_weights", {"mc": 0.6, "stress": 0.3, "tornado": 0.1})
+
+            if run_sim:
                 try:
-                    df_src = parse_portfolio_json(txt)
-                    df_base = enrich_with_meta(df_src)
-                    edited = df_base  # simple table; we avoid data_editor incompatibilities
-                    tot = float(edited["value_clp"].sum())
-                    rv_amt = float((edited["value_clp"] * edited["rv_share"]).sum())
-                    rf_pura_amt = float(edited.loc[edited["bucket"] == "RF_PURA", "value_clp"].sum())
-                    c1, c2, c3 = st.columns(3)
-                    with c1: st.metric("Patrimonio (CLP)", f"${fmt(tot)}")
-                    with c2: st.metric("Motor (RV) estimado", f"{(100.0 * rv_amt / tot) if tot>0 else 0:.1f}%")
-                    with c3: st.metric("RF pura hoy", f"${fmt(rf_pura_amt)}")
-                    for _, r in edited.iterrows():
-                        positions.append(InstrumentPosition(
-                            instrument_id=str(r["instrument_id"]),
-                            name=str(r["name"]),
-                            value_clp=float(r["value_clp"]),
-                            rv_share=float(r.get("rv_share", 0.0)),
-                            rv_min=float(r.get("rv_min", 0.0)),
-                            rv_max=float(r.get("rv_max", 1.0)),
-                            liquidity_days=int(r.get("liquidity_days", 3)),
-                            bucket=str(r.get("bucket", "BAL")),
-                            priority=int(r.get("priority", 30)),
-                            include_withdrawals=bool(r.get("include_withdrawals", True)),
-                        ))
-                except Exception as e:
-                    st.error(f"No pude parsear JSON: {e}")
-        else:
-            st.info("Modo agregado: valores por defecto aplicados si no cambias nada.")
-            cap_val = clean_input("Capital Total ($)", 1800000000, "cap")  # default 1.800.000.000
-            st.markdown(f"**Patrimonio usado por defecto:** ${fmt(st.session_state.get('num__cap', 1800000000))}")
-            # default RV % control
-            rv_pct = st.slider("Motor (RV %)", 0, 100, 60, key="rv_pct_main")
-            # show RF reserve
-            st.metric("Reserva RF (estimada)", f"${fmt(int(cap_val * (1 - rv_pct/100)))}")
+                    if use_portfolio:
+                        if not positions:
+                            st.error("Modo instrumentos activo pero no hay posiciones válidas.")
+                            st.stop()
+                        rules = PortfolioRulesConfig()
+                        rules.manager_riskoff_in_crisis = float(adv.get('manager_riskoff', 0.20))
+                        paths, cpi, r_i = run_simulation(cfg_current, True, positions, wds, rules)
+                    else:
+                        paths, cpi, r_i = run_simulation(cfg_current, False, [], wds, None)
 
-        st.markdown("### Perfil de gastos (mes)")
-        # Defaults requested: F1=6.000.000 por 7 años; F2=5.000.000 hasta año 20; F3=4.000.000 desde año 20
-        cols = st.columns(3)
-        with cols[0]:
-            r1 = clean_input("Gasto F1 (CLP/mes)", 6000000, "r1")
-            d1 = st.number_input("Años F1", 0, 40, 7, key="d1")  # default 7
-        with cols[1]:
-            r2 = clean_input("Gasto F2 (CLP/mes)", 5000000, "r2")
-            d2 = st.number_input("Años F2", 0, 40, 13, key="d2")  # 7->20 -> 13 years duration
-        with cols[2]:
-            r3 = clean_input("Gasto F3 (CLP/mes)", 4000000, "r3")
-            d3 = st.number_input("Años F3", 0, 40, 20, key="d3")  # last 20 years
+                    success_pct = float((r_i <= -1).mean() * 100.0)
+                    ci_low, ci_high = success_ci(success_pct, int(cfg_current.n_sims))
+                    terminal_real = paths[:, -1] / np.maximum(cpi[:, -1], 1e-9)
+                    p10 = float(np.percentile(terminal_real, 10))
+                    p50 = float(np.percentile(terminal_real, 50))
+                    p90 = float(np.percentile(terminal_real, 90))
+                    ruined = (r_i > -1)
+                    ruin_years = (r_i[ruined] / 12.0) if np.any(ruined) else np.array([])
+                    ruin_stats = compute_ruin_stats(r_i, cfg_current.steps_per_year, cfg_current.horizon_years)
 
-        # ensure d2 is difference to 20 (we interpret d2 as years for phase 2; default set to 13)
-        # Build withdrawals according to these phase durations but aligned to requested scheme:
-        # from 0 to d1: r1; from d1 to d1+d2: r2; from d1+d2 to horizon: r3
-        wds = [
-            WithdrawalTramo(0, int(d1), int(r1)),
-            WithdrawalTramo(int(d1), int(d1 + d2), int(r2)),
-            WithdrawalTramo(int(d1 + d2), int(d1 + d2 + d3), int(r3)),
-        ]
+                    p90_path = np.percentile(paths, 90, axis=0)
+                    p10_path = np.percentile(paths, 10, axis=0)
+                    p50_path = np.percentile(paths, 50, axis=0)
+                    y_ax = np.arange(paths.shape[1]) / 12.0
 
-        # Extra events
-        with st.expander("💸 Inyecciones o Salidas"):
-            st.session_state.setdefault('extra_events', [])
-            ce1, ce2, ce3, ce4 = st.columns([1,2,2,1])
-            with ce1:
-                st.number_input('Año', 1, 40, int(st.session_state.get('evy', 5)), key='evy')
-            with ce2:
-                clean_input('Monto ($)', 0, 'eva')
-            with ce3:
-                st.selectbox('Tipo', ['Entrada', 'Salida'], key='evt')
-            with ce4:
-                if st.button('Add', key='add_extra'):
-                    y = int(st.session_state.get('evy', 1))
-                    a = int(st.session_state.get('num__eva', 0))
-                    t = str(st.session_state.get('evt', 'Entrada'))
-                    amt = a if t == 'Entrada' else -a
-                    st.session_state['extra_events'].append({"year": int(y), "amount": float(amt), "name": "Hito"})
-            for e in st.session_state['extra_events']:
-                st.text(f"Año {int(e['year'])}: ${fmt(e['amount'])}")
-            if st.button('Limpiar', key='clear_extra'):
-                st.session_state['extra_events'] = []
+                    st.session_state["last_withdrawals"] = wds
+                    st.session_state["last_run"] = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "success_pct": success_pct,
+                        "success_ci": [ci_low, ci_high],
+                        "median_terminal_real": p50,
+                        "p10_terminal_real": p10,
+                        "p90_terminal_real": p90,
+                        "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
+                        "ruin_stats": ruin_stats,
+                        "plot_years": y_ax.tolist(),
+                        "plot_p10": p10_path.tolist(),
+                        "plot_p50": p50_path.tolist(),
+                        "plot_p90": p90_path.tolist(),
+                        "cfg": cfg_current.__dict__.copy(),
+                    }
 
-        # House emergency defaults
-        enable_p = st.checkbox("Venta Casa Emergencia", value=True, key="enable_prop")
-        val_h = clean_input("Valor Neto Casa ($)", 500000000, "vi") if enable_p else 0  # default 500M
+                    if auto_models:
+                        quick_sims = 300
+                        stress_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
+                        stress_cfg.n_sims = quick_sims
+                        stress_cfg.stress_schedule = make_stress_schedule(stress_cfg.horizon_years, "Global crash 18m")
+                        paths_s, cpi_s, r_i_s = run_simulation(stress_cfg, False, [], wds, None)
+                        stress_success = float((r_i_s <= -1).mean() * 100.0)
+                        st.session_state["last_stress"] = {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "success_pct": stress_success,
+                            "success_ci": list(success_ci(stress_success, int(stress_cfg.n_sims))),
+                        }
+                        tornado_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
+                        tornado_cfg.n_sims = quick_sims
+                        params_quick = [
+                            ("mu_normal_rv", [tornado_cfg.mu_normal_rv - 0.02, tornado_cfg.mu_normal_rv, tornado_cfg.mu_normal_rv + 0.02]),
+                            ("pct_discretionary", [max(0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) - 0.1)),
+                                                   float(st.session_state['advanced'].get('pct_discretionary', 0.2)),
+                                                   min(1.0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) + 0.1))]),
+                        ]
+                        rows = []
+                        for name, vals in params_quick:
+                            for v in vals:
+                                cfg = SimulationConfig(**{k: v for k, v in tornado_cfg.__dict__.items()})
+                                if name == "pct_discretionary":
+                                    cfg.pct_discretionary = float(v)
+                                elif name == "mu_normal_rv":
+                                    cfg.mu_normal_rv = float(v)
+                                paths_t, cpi_t, r_i_t = run_simulation(cfg, False, [], wds, None)
+                                rows.append({"param": name, "value": v, "success_pct": float((r_i_t <= -1).mean() * 100.0)})
+                        df_quick = pd.DataFrame(rows)
+                        tornado_score = float(df_quick["success_pct"].mean()) if not df_quick.empty else None
+                        st.session_state["last_tornado"] = {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "success_pct": tornado_score,
+                            "rows": df_quick.to_dict(orient="records"),
+                        }
+                except NotImplementedError as e:
+                    st.error(f"Función no implementada: {e}. Si usas modo Cartera Real, asegúrate que PortfolioSimulator.run esté definido en este archivo.")
 
-        # Build SimulationConfig with conversions
-        adv = st.session_state.get('advanced', {})
-        mu_rv_cont = to_continuous_mu(c_rv_in if 'c_rv_in' in locals() else 0.11)
-        mu_rf_cont = to_continuous_mu(c_rf_in if 'c_rf_in' in locals() else 0.06)
-
-        cfg_current = SimulationConfig(
-            horizon_years=int(horiz),
-            initial_capital=int(st.session_state.get('num__cap', 1800000000)),
-            n_sims=int(st.session_state.get('n_sims_main', 2000)),
-            is_active_managed=bool(st.session_state.get('is_active_cb', True)),
-            enable_prop=bool(st.session_state.get('enable_prop', True)),
-            net_inmo_value=float(st.session_state.get('num__vi', 500000000)),
-            mu_normal_rv=mu_rv_cont,
-            mu_normal_rf=mu_rf_cont,
-            extra_cashflows=[ExtraCashflow(int(e["year"]), float(e["amount"]), e.get("name", "Hito")) for e in st.session_state.get("extra_events", [])],
-            mu_global_rv=-0.22,
-            mu_global_rf=-0.02,
-            corr_global=0.75,
-            corr_normal=float(adv.get('corr_normal', 0.35)),
-            p_def=float(adv.get('p_def', 1.0)),
-            vol_factor_active=float(adv.get('vol_factor_active', 0.80)),
-            sale_cost_pct=float(adv.get('sale_cost_pct', 0.02)),
-            sale_delay_months=int(adv.get('sale_delay_months', 3)),
-            pct_discretionary=float(adv.get('pct_discretionary', 0.20)),
-            discretionary_cut_in_crisis=float(adv.get('discretionary_cut_in_crisis', 0.60)),
-            rf_reserve_years=float(adv.get('rf_reserve_years', 3.5)),
-            t_df=int(8),
-            random_seed=12345,
-        )
-
-        # Run simulation
-        auto_models = st.checkbox("Ejecutar Stress/Tornado automáticamente (rápido)", value=True, key="auto_models")
-        if st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim"):
-            # If use_portfolio -> positions must be filled and PortfolioSimulator.run must be available
-            try:
-                if use_portfolio:
-                    if not positions:
-                        st.error("Modo instrumentos activo pero no hay posiciones válidas.")
-                        st.stop()
-                    rules = PortfolioRulesConfig()
-                    rules.manager_riskoff_in_crisis = float(adv.get('manager_riskoff', 0.20))
-                    paths, cpi, r_i = run_simulation(cfg_current, True, positions, wds, rules)
-                else:
-                    paths, cpi, r_i = run_simulation(cfg_current, False, [], wds, None)
-
-                # results
-                success_pct = float((r_i <= -1).mean() * 100.0)
-                ci_low, ci_high = success_ci(success_pct, int(cfg_current.n_sims))
-                terminal_real = paths[:, -1] / np.maximum(cpi[:, -1], 1e-9)
-                p10 = float(np.percentile(terminal_real, 10))
-                p50 = float(np.percentile(terminal_real, 50))
-                p90 = float(np.percentile(terminal_real, 90))
-                ruined = (r_i > -1)
-                ruin_years = (r_i[ruined] / 12.0) if np.any(ruined) else np.array([])
-                ruin_stats = compute_ruin_stats(r_i, cfg_current.steps_per_year, cfg_current.horizon_years)
-
-                st.markdown(f"<div style='padding:12px; border-radius:8px; background:#091121; color:#fff;'>"
-                            f"<h2>Éxito: {success_pct:.1f}% (IC95%: {ci_low:.1f}%–{ci_high:.1f}%)</h2>"
-                            f"<p>Mediana legado real: ${fmt(p50)} | P10: ${fmt(p10)} | P90: ${fmt(p90)}</p>"
-                            f"</div>", unsafe_allow_html=True)
-                last_stress = st.session_state.get("last_stress")
-                last_tornado = st.session_state.get("last_tornado")
+            last_run = st.session_state.get("last_run")
+            last_stress = st.session_state.get("last_stress")
+            last_tornado = st.session_state.get("last_tornado")
+            if not last_run:
+                st.info("Ejecuta una simulación para ver el indicador principal y los resultados.")
+            else:
                 scores = {
-                    "mc": success_pct,
+                    "mc": last_run.get("success_pct"),
                     "stress": last_stress.get("success_pct") if last_stress else None,
                     "tornado": last_tornado.get("success_pct") if last_tornado else None,
                 }
-                weights = st.session_state.get("score_weights", {"mc": 0.6, "stress": 0.3, "tornado": 0.1})
-                agg_score = aggregate_success_score(scores, weights)
-                st.markdown("### ⭐ Indicador principal")
-                col_a, col_b, col_c, col_d = st.columns(4)
-                col_a.metric("Agregado", f"{agg_score:.1f}%" if agg_score is not None else "—")
-                col_b.metric("Monte Carlo", f"{success_pct:.1f}%")
-                col_c.metric("Stress", f"{scores['stress']:.1f}%" if scores["stress"] is not None else "—")
-                col_d.metric("Tornado", f"{scores['tornado']:.1f}%" if scores["tornado"] is not None else "—")
-                st.caption("El agregado usa las ponderaciones configuradas en el sidebar. Ejecuta Stress/Tornado para completar el indicador.")
+                render_score_bar(scores, weights)
 
-                # plot envelope
-                y_ax = np.arange(paths.shape[1]) / 12.0
+                kpi_cols = st.columns(3)
+                kpi_cols[0].metric("Éxito Monte Carlo", f"{last_run['success_pct']:.1f}%", f"IC95% {last_run['success_ci'][0]:.1f}%–{last_run['success_ci'][1]:.1f}%")
+                kpi_cols[1].metric("Mediana legado real", f"${fmt(last_run['median_terminal_real'])}")
+                kpi_cols[2].metric("P10 / P90 legado real", f"${fmt(last_run['p10_terminal_real'])} · ${fmt(last_run['p90_terminal_real'])}")
+
                 fig = go.Figure()
-                p90_path = np.percentile(paths, 90, axis=0)
-                p10_path = np.percentile(paths, 10, axis=0)
-                p50_path = np.percentile(paths, 50, axis=0)
-                fig.add_trace(go.Scatter(x=np.concatenate([y_ax, y_ax[::-1]]),
-                                         y=np.concatenate([p90_path, p10_path[::-1]]),
-                                         fill='toself', fillcolor='rgba(59,130,246,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
-                fig.add_trace(go.Scatter(x=y_ax, y=p50_path, line=dict(color='#3b82f6', width=3), name='Mediana'))
+                years = np.array(last_run.get("plot_years", []))
+                p90_path = np.array(last_run.get("plot_p90", []))
+                p10_path = np.array(last_run.get("plot_p10", []))
+                p50_path = np.array(last_run.get("plot_p50", []))
+                if years.size and p90_path.size and p10_path.size:
+                    fig.add_trace(go.Scatter(x=np.concatenate([years, years[::-1]]),
+                                             y=np.concatenate([p90_path, p10_path[::-1]]),
+                                             fill='toself', fillcolor='rgba(59,130,246,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
+                    fig.add_trace(go.Scatter(x=years, y=p50_path, line=dict(color='#3b82f6', width=3), name='Mediana'))
                 fig.update_layout(title="Proyección Patrimonio (Nominal)", template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
 
-                # save last_run
-                st.session_state["last_withdrawals"] = wds
-                st.session_state["last_run"] = {
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "success_pct": success_pct,
-                    "success_ci": [ci_low, ci_high],
-                    "median_terminal_real": p50,
-                    "p10_terminal_real": p10,
-                    "p90_terminal_real": p90,
-                    "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
-                    "ruin_stats": ruin_stats,
-                    "cfg": cfg_current.__dict__.copy(),
-                }
-                if auto_models:
-                    quick_sims = 300
-                    stress_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
-                    stress_cfg.n_sims = quick_sims
-                    stress_cfg.stress_schedule = make_stress_schedule(stress_cfg.horizon_years, "Global crash 18m")
-                    paths_s, cpi_s, r_i_s = run_simulation(stress_cfg, False, [], wds, None)
-                    stress_success = float((r_i_s <= -1).mean() * 100.0)
-                    st.session_state["last_stress"] = {
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "success_pct": stress_success,
-                        "success_ci": list(success_ci(stress_success, int(stress_cfg.n_sims))),
-                    }
-                    tornado_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
-                    tornado_cfg.n_sims = quick_sims
-                    params_quick = [
-                        ("mu_normal_rv", [tornado_cfg.mu_normal_rv - 0.02, tornado_cfg.mu_normal_rv, tornado_cfg.mu_normal_rv + 0.02]),
-                        ("pct_discretionary", [max(0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) - 0.1)),
-                                               float(st.session_state['advanced'].get('pct_discretionary', 0.2)),
-                                               min(1.0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) + 0.1))]),
-                    ]
-                    rows = []
-                    for name, vals in params_quick:
-                        for v in vals:
-                            cfg = SimulationConfig(**{k: v for k, v in tornado_cfg.__dict__.items()})
-                            if name == "pct_discretionary":
-                                cfg.pct_discretionary = float(v)
-                            elif name == "mu_normal_rv":
-                                cfg.mu_normal_rv = float(v)
-                            paths_t, cpi_t, r_i_t = run_simulation(cfg, False, [], wds, None)
-                            rows.append({"param": name, "value": v, "success_pct": float((r_i_t <= -1).mean() * 100.0)})
-                    df_quick = pd.DataFrame(rows)
-                    tornado_score = float(df_quick["success_pct"].mean()) if not df_quick.empty else None
-                    st.session_state["last_tornado"] = {
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "success_pct": tornado_score,
-                        "rows": df_quick.to_dict(orient="records"),
-                    }
-            except NotImplementedError as e:
-                st.error(f"Función no implementada: {e}. Si usas modo Cartera Real, asegúrate que PortfolioSimulator.run esté definido en este archivo.")
+                if not scores.get("stress") or not scores.get("tornado"):
+                    st.caption("Ejecuta Stress y Tornado para completar el indicador agregado con todos los modelos.")
 
     # ----------------------
     # Tab Stress
