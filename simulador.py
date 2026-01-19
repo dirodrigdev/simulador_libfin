@@ -85,7 +85,11 @@ def aggregate_success_score(scores: Dict[str, Optional[float]], weights: Dict[st
         return None
     return sum(float(weights.get(k, 0.0)) * float(usable[k]) for k in usable.keys()) / weight_sum
 
-def render_score_bar(scores: Dict[str, Optional[float]], weights: Dict[str, float]) -> None:
+def render_score_bar(
+    scores: Dict[str, Optional[float]],
+    weights: Dict[str, float],
+    note: Optional[str] = None,
+) -> None:
     agg_score = aggregate_success_score(scores, weights)
     def fmt_pct(val: Optional[float]) -> str:
         return f"{val:.1f}%" if val is not None else "—"
@@ -164,6 +168,7 @@ def render_score_bar(scores: Dict[str, Optional[float]], weights: Dict[str, floa
             </div>
             <div class="score-meta">Pesos configurables en el sidebar · MC {weights.get("mc", 0):.0%} · Stress {weights.get("stress", 0):.0%} · Tornado {weights.get("tornado", 0):.0%}</div>
         </div>
+        {f'<div class="score-meta">{note}</div>' if note else ''}
         """,
         unsafe_allow_html=True,
     )
@@ -206,7 +211,7 @@ class SimulationConfig:
     guardrail_trigger: float = 0.20
     guardrail_cut: float = 0.10
 
-    enable_prop: bool = True
+    enable_prop: float = True
     net_inmo_value: float = 500000000.0
     new_rent_cost: float = 1500000.0
     emergency_months_trigger: int = 24
@@ -719,11 +724,20 @@ def app():
             st.slider("Peso Monte Carlo", 0.0, 1.0, float(w.get('mc', 0.6)), 0.05, key="w_mc")
             st.slider("Peso Stress", 0.0, 1.0, float(w.get('stress', 0.3)), 0.05, key="w_stress")
             st.slider("Peso Tornado", 0.0, 1.0, float(w.get('tornado', 0.1)), 0.05, key="w_tornado")
-            st.session_state['score_weights'].update({
+            st.checkbox("Auto-normalizar (suma 100%)", value=True, key="weights_autonorm")
+            w_raw = {
                 'mc': float(st.session_state.get('w_mc', w.get('mc', 0.6))),
                 'stress': float(st.session_state.get('w_stress', w.get('stress', 0.3))),
                 'tornado': float(st.session_state.get('w_tornado', w.get('tornado', 0.1))),
-            })
+            }
+            total = sum(w_raw.values())
+            if st.session_state.get("weights_autonorm", True) and total > 0:
+                st.session_state['score_weights'].update({k: v / total for k, v in w_raw.items()})
+                st.caption(f"Suma actual: {total:.2f} → normalizada a 100%.")
+            else:
+                st.session_state['score_weights'].update(w_raw)
+                if abs(total - 1.0) > 0.01:
+                    st.warning(f"Las ponderaciones suman {total:.2f}. Ajusta para llegar a 1.00 (100%).")
 
     # Tabs
     tab_sim, tab_stress, tab_tornado, tab_sum = st.tabs(["📊 Simulación", "🧯 Stress", "🌪️ Tornado", "🧾 Resumen"])
@@ -733,6 +747,19 @@ def app():
     # ----------------------
     with tab_sim:
         st.subheader("Simulación principal")
+        st.markdown(
+            """
+            <style>
+            .run-sim-button button {
+                position: sticky;
+                bottom: 1.25rem;
+                z-index: 50;
+                box-shadow: 0 10px 24px rgba(15, 23, 42, 0.35);
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
         col_inputs, col_results = st.columns([0.45, 0.55], gap="large")
         use_portfolio = st.session_state.get("use_portfolio", False)
         positions: List[InstrumentPosition] = []
@@ -852,9 +879,12 @@ def app():
                 random_seed=12345,
             )
 
-            st.markdown("### 4) Ejecución rápida")
-            auto_models = st.checkbox("Ejecutar Stress/Tornado automáticamente (rápido)", value=True, key="auto_models")
-            run_sim = st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim")
+            st.markdown("### 4) Ejecución")
+            st.caption("Se ejecutan Monte Carlo, Stress y Tornado en un solo disparo.")
+            with st.container():
+                st.markdown('<div class="run-sim-button">', unsafe_allow_html=True)
+                run_sim = st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim")
+                st.markdown('</div>', unsafe_allow_html=True)
 
         with col_results:
             last_run = st.session_state.get("last_run")
@@ -864,6 +894,10 @@ def app():
 
             if run_sim:
                 try:
+                    with st.spinner("Ejecutando Monte Carlo, Stress y Tornado..."):
+                        st.session_state["last_run"] = None
+                        st.session_state["last_stress"] = None
+                        st.session_state["last_tornado"] = None
                     if use_portfolio:
                         if not positions:
                             st.error("Modo instrumentos activo pero no hay posiciones válidas.")
@@ -906,58 +940,58 @@ def app():
                         "cfg": cfg_current.__dict__.copy(),
                     }
 
-                    if auto_models:
-                        quick_sims = 300
-                        stress_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
-                        stress_cfg.n_sims = quick_sims
-                        stress_cfg.stress_schedule = make_stress_schedule(stress_cfg.horizon_years, "Global crash 18m")
-                        paths_s, cpi_s, r_i_s = run_simulation(stress_cfg, False, [], wds, None)
-                        stress_success = float((r_i_s <= -1).mean() * 100.0)
-                        st.session_state["last_stress"] = {
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                            "success_pct": stress_success,
-                            "success_ci": list(success_ci(stress_success, int(stress_cfg.n_sims))),
-                        }
-                        tornado_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
-                        tornado_cfg.n_sims = quick_sims
-                        params_quick = [
-                            ("mu_normal_rv", [tornado_cfg.mu_normal_rv - 0.02, tornado_cfg.mu_normal_rv, tornado_cfg.mu_normal_rv + 0.02]),
-                            ("pct_discretionary", [max(0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) - 0.1)),
-                                                   float(st.session_state['advanced'].get('pct_discretionary', 0.2)),
-                                                   min(1.0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) + 0.1))]),
-                        ]
-                        rows = []
-                        for name, vals in params_quick:
-                            for v in vals:
-                                cfg = SimulationConfig(**{k: v for k, v in tornado_cfg.__dict__.items()})
-                                if name == "pct_discretionary":
-                                    cfg.pct_discretionary = float(v)
-                                elif name == "mu_normal_rv":
-                                    cfg.mu_normal_rv = float(v)
-                                paths_t, cpi_t, r_i_t = run_simulation(cfg, False, [], wds, None)
-                                rows.append({"param": name, "value": v, "success_pct": float((r_i_t <= -1).mean() * 100.0)})
-                        df_quick = pd.DataFrame(rows)
-                        tornado_score = float(df_quick["success_pct"].mean()) if not df_quick.empty else None
-                        st.session_state["last_tornado"] = {
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                            "success_pct": tornado_score,
-                            "rows": df_quick.to_dict(orient="records"),
-                        }
+                    quick_sims = 300
+                    stress_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
+                    stress_cfg.n_sims = quick_sims
+                    stress_cfg.stress_schedule = make_stress_schedule(stress_cfg.horizon_years, "Global crash 18m")
+                    paths_s, cpi_s, r_i_s = run_simulation(stress_cfg, False, [], wds, None)
+                    stress_success = float((r_i_s <= -1).mean() * 100.0)
+                    st.session_state["last_stress"] = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "success_pct": stress_success,
+                        "success_ci": list(success_ci(stress_success, int(stress_cfg.n_sims))),
+                    }
+                    tornado_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
+                    tornado_cfg.n_sims = quick_sims
+                    params_quick = [
+                        ("mu_normal_rv", [tornado_cfg.mu_normal_rv - 0.02, tornado_cfg.mu_normal_rv, tornado_cfg.mu_normal_rv + 0.02]),
+                        ("pct_discretionary", [max(0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) - 0.1)),
+                                               float(st.session_state['advanced'].get('pct_discretionary', 0.2)),
+                                               min(1.0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) + 0.1))]),
+                    ]
+                    rows = []
+                    for name, vals in params_quick:
+                        for v in vals:
+                            cfg = SimulationConfig(**{k: v for k, v in tornado_cfg.__dict__.items()})
+                            if name == "pct_discretionary":
+                                cfg.pct_discretionary = float(v)
+                            elif name == "mu_normal_rv":
+                                cfg.mu_normal_rv = float(v)
+                            paths_t, cpi_t, r_i_t = run_simulation(cfg, False, [], wds, None)
+                            rows.append({"param": name, "value": v, "success_pct": float((r_i_t <= -1).mean() * 100.0)})
+                    df_quick = pd.DataFrame(rows)
+                    tornado_score = float(df_quick["success_pct"].mean()) if not df_quick.empty else None
+                    st.session_state["last_tornado"] = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "success_pct": tornado_score,
+                        "rows": df_quick.to_dict(orient="records"),
+                    }
                 except NotImplementedError as e:
                     st.error(f"Función no implementada: {e}. Si usas modo Cartera Real, asegúrate que PortfolioSimulator.run esté definido en este archivo.")
 
             last_run = st.session_state.get("last_run")
             last_stress = st.session_state.get("last_stress")
             last_tornado = st.session_state.get("last_tornado")
+            scores = {
+                "mc": last_run.get("success_pct") if last_run else None,
+                "stress": last_stress.get("success_pct") if last_stress else None,
+                "tornado": last_tornado.get("success_pct") if last_tornado else None,
+            }
+            render_score_bar(scores, weights, note="Indicador principal siempre visible. Ejecuta la simulación para actualizarlo.")
             if not last_run:
-                st.info("Ejecuta una simulación para ver el indicador principal y los resultados.")
+                st.info("Ejecuta una simulación para ver los resultados detallados.")
             else:
-                scores = {
-                    "mc": last_run.get("success_pct"),
-                    "stress": last_stress.get("success_pct") if last_stress else None,
-                    "tornado": last_tornado.get("success_pct") if last_tornado else None,
-                }
-                render_score_bar(scores, weights)
+                st.caption(f"Última corrida: {last_run['timestamp']}")
 
                 kpi_cols = st.columns(3)
                 kpi_cols[0].metric("Éxito Monte Carlo", f"{last_run['success_pct']:.1f}%", f"IC95% {last_run['success_ci'][0]:.1f}%–{last_run['success_ci'][1]:.1f}%")
@@ -976,9 +1010,6 @@ def app():
                     fig.add_trace(go.Scatter(x=years, y=p50_path, line=dict(color='#3b82f6', width=3), name='Mediana'))
                 fig.update_layout(title="Proyección Patrimonio (Nominal)", template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
-
-                if not scores.get("stress") or not scores.get("tornado"):
-                    st.caption("Ejecuta Stress y Tornado para completar el indicador agregado con todos los modelos.")
 
     # ----------------------
     # Tab Stress
