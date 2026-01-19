@@ -605,12 +605,12 @@ def app():
             else:
                 c_rv_in, c_rf_in = 0.13, 0.07
 
-        n_sims = st.slider("Simulaciones (principal)", 500, 5000, 2000, step=100, key="n_sims_main")
         horiz = st.slider("Horizonte (años)", 10, 50, 40, key="horiz_main")
 
         # Advanced always shown and expanded
         with st.expander("Configuración avanzada (sidebar) — siempre visible", expanded=True):
             adv = st.session_state['advanced']
+            st.slider("Simulaciones (principal)", 500, 5000, 2000, step=100, key="n_sims_main")
             st.number_input("p_def (shock damping en crisis, advanced)", 0.0, 2.0, adv.get('p_def', 1.0), step=0.05, key="p_def")
             st.number_input("vol_factor_active (si gestor activo)", 0.1, 1.0, adv.get('vol_factor_active', 0.80), step=0.05, key="vol_factor_active")
             st.slider("manager_riskoff_in_crisis (0..1)", 0.0, 1.0, adv.get('manager_riskoff', 0.20), 0.05, key="manager_riskoff")
@@ -773,6 +773,7 @@ def app():
         )
 
         # Run simulation
+        auto_models = st.checkbox("Ejecutar Stress/Tornado automáticamente (rápido)", value=True, key="auto_models")
         if st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim"):
             # If use_portfolio -> positions must be filled and PortfolioSimulator.run must be available
             try:
@@ -801,6 +802,12 @@ def app():
                             f"<h2>Éxito: {success_pct:.1f}% (IC95%: {ci_low:.1f}%–{ci_high:.1f}%)</h2>"
                             f"<p>Mediana legado real: ${fmt(p50)} | P10: ${fmt(p10)} | P90: ${fmt(p90)}</p>"
                             f"</div>", unsafe_allow_html=True)
+                scores = {"mc": success_pct, "stress": None, "tornado": None}
+                weights = st.session_state.get("score_weights", {"mc": 0.6, "stress": 0.3, "tornado": 0.1})
+                agg_score = aggregate_success_score(scores, weights)
+                if agg_score is not None:
+                    st.markdown(f"**Indicador agregado (base Monte Carlo): {agg_score:.1f}%**")
+                    st.caption("Corre Stress y Tornado para incorporar sus ponderaciones al indicador agregado.")
 
                 # plot envelope
                 y_ax = np.arange(paths.shape[1]) / 12.0
@@ -828,6 +835,43 @@ def app():
                     "ruin_stats": ruin_stats,
                     "cfg": cfg_current.__dict__.copy(),
                 }
+                if auto_models:
+                    quick_sims = 300
+                    stress_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
+                    stress_cfg.n_sims = quick_sims
+                    stress_cfg.stress_schedule = make_stress_schedule(stress_cfg.horizon_years, "Global crash 18m")
+                    paths_s, cpi_s, r_i_s = run_simulation(stress_cfg, False, [], wds, None)
+                    stress_success = float((r_i_s <= -1).mean() * 100.0)
+                    st.session_state["last_stress"] = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "success_pct": stress_success,
+                        "success_ci": list(success_ci(stress_success, int(stress_cfg.n_sims))),
+                    }
+                    tornado_cfg = SimulationConfig(**{k: v for k, v in cfg_current.__dict__.items() if k in SimulationConfig.__annotations__})
+                    tornado_cfg.n_sims = quick_sims
+                    params_quick = [
+                        ("mu_normal_rv", [tornado_cfg.mu_normal_rv - 0.02, tornado_cfg.mu_normal_rv, tornado_cfg.mu_normal_rv + 0.02]),
+                        ("pct_discretionary", [max(0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) - 0.1)),
+                                               float(st.session_state['advanced'].get('pct_discretionary', 0.2)),
+                                               min(1.0, float(st.session_state['advanced'].get('pct_discretionary', 0.2) + 0.1))]),
+                    ]
+                    rows = []
+                    for name, vals in params_quick:
+                        for v in vals:
+                            cfg = SimulationConfig(**{k: v for k, v in tornado_cfg.__dict__.items()})
+                            if name == "pct_discretionary":
+                                cfg.pct_discretionary = float(v)
+                            elif name == "mu_normal_rv":
+                                cfg.mu_normal_rv = float(v)
+                            paths_t, cpi_t, r_i_t = run_simulation(cfg, False, [], wds, None)
+                            rows.append({"param": name, "value": v, "success_pct": float((r_i_t <= -1).mean() * 100.0)})
+                    df_quick = pd.DataFrame(rows)
+                    tornado_score = float(df_quick["success_pct"].mean()) if not df_quick.empty else None
+                    st.session_state["last_tornado"] = {
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        "success_pct": tornado_score,
+                        "rows": df_quick.to_dict(orient="records"),
+                    }
             except NotImplementedError as e:
                 st.error(f"Función no implementada: {e}. Si usas modo Cartera Real, asegúrate que PortfolioSimulator.run esté definido en este archivo.")
 
@@ -839,7 +883,10 @@ def app():
         scenario = st.selectbox("Escenario predefinido", ["Ninguno", "Global crash 18m", "Local crisis 24m", "Flash crash 4m"])
         custom_start = st.number_input("Inicio custom (mes desde hoy)", 0, 480, 0)
         custom_len = st.number_input("Duración custom (meses)", 0, 480, 0)
-        n_sims_stress = st.number_input("Simulaciones por stress", 200, 5000, 500, step=100)
+        with st.expander("Ajustes avanzados (stress)", expanded=False):
+            n_sims_stress = st.number_input("Simulaciones por stress", 200, 5000, 500, step=100)
+        if "n_sims_stress" not in locals():
+            n_sims_stress = 500
 
         if st.button("Ejecutar Stress"):
             cfg = st.session_state.get("last_run", {}).get("cfg", None)
@@ -885,7 +932,10 @@ def app():
     # ----------------------
     with tab_tornado:
         st.subheader("Análisis Tornado (sensibilidad univariada)")
-        tornado_n_sims = st.number_input("Simulaciones por punto (tornado)", 200, 3000, 500, step=100)
+        with st.expander("Ajustes avanzados (tornado)", expanded=False):
+            tornado_n_sims = st.number_input("Simulaciones por punto (tornado)", 200, 3000, 500, step=100)
+        if "tornado_n_sims" not in locals():
+            tornado_n_sims = 500
         run_tornado = st.button("Ejecutar Tornado")
         if run_tornado:
             st.info("Ejecutando Tornado — puede tardar varios minutos.")
@@ -931,14 +981,32 @@ def app():
                 "rows": df_tornado.to_dict(orient="records"),
             }
             st.dataframe(df_tornado)
-            # simple bar: delta success relative to median value
-            baseline = df_tornado.groupby("param").apply(lambda g: g.loc[g["value"]==g["value"].median()].iloc[0]["success_pct"] if not g.empty else 0).to_dict()
-            fig = go.Figure()
-            for param in df_tornado['param'].unique():
-                sub = df_tornado[df_tornado['param']==param]
-                fig.add_trace(go.Bar(x=sub['value'].astype(str), y=sub['success_pct'], name=param))
-            fig.update_layout(barmode='group', title="Tornado — %Éxito por valor de parámetro")
-            st.plotly_chart(fig, use_container_width=True)
+            # Tornado: rango de impacto vs baseline (valor medio)
+            if not df_tornado.empty:
+                impacts = []
+                for param, group in df_tornado.groupby("param"):
+                    values = sorted(group["value"].tolist())
+                    baseline_val = values[len(values) // 2]
+                    baseline = float(group.loc[group["value"] == baseline_val, "success_pct"].iloc[0])
+                    min_delta = float(group["success_pct"].min() - baseline)
+                    max_delta = float(group["success_pct"].max() - baseline)
+                    impacts.append({"param": param, "min_delta": min_delta, "max_delta": max_delta})
+                df_imp = pd.DataFrame(impacts)
+                fig = go.Figure()
+                fig.add_trace(go.Bar(
+                    y=df_imp["param"],
+                    x=df_imp["max_delta"],
+                    base=df_imp["min_delta"],
+                    orientation="h",
+                    marker_color="#3b82f6",
+                    name="Impacto vs baseline",
+                ))
+                fig.update_layout(
+                    title="Tornado — impacto en %Éxito (vs baseline)",
+                    xaxis_title="Delta %Éxito",
+                    template="plotly_dark",
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
             # provide download CSV
             csv = df_tornado.to_csv(index=False).encode('utf-8')
