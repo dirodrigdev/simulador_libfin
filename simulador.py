@@ -802,12 +802,22 @@ def app():
                             f"<h2>Éxito: {success_pct:.1f}% (IC95%: {ci_low:.1f}%–{ci_high:.1f}%)</h2>"
                             f"<p>Mediana legado real: ${fmt(p50)} | P10: ${fmt(p10)} | P90: ${fmt(p90)}</p>"
                             f"</div>", unsafe_allow_html=True)
-                scores = {"mc": success_pct, "stress": None, "tornado": None}
+                last_stress = st.session_state.get("last_stress")
+                last_tornado = st.session_state.get("last_tornado")
+                scores = {
+                    "mc": success_pct,
+                    "stress": last_stress.get("success_pct") if last_stress else None,
+                    "tornado": last_tornado.get("success_pct") if last_tornado else None,
+                }
                 weights = st.session_state.get("score_weights", {"mc": 0.6, "stress": 0.3, "tornado": 0.1})
                 agg_score = aggregate_success_score(scores, weights)
-                if agg_score is not None:
-                    st.markdown(f"**Indicador agregado (base Monte Carlo): {agg_score:.1f}%**")
-                    st.caption("Corre Stress y Tornado para incorporar sus ponderaciones al indicador agregado.")
+                st.markdown("### ⭐ Indicador principal")
+                col_a, col_b, col_c, col_d = st.columns(4)
+                col_a.metric("Agregado", f"{agg_score:.1f}%" if agg_score is not None else "—")
+                col_b.metric("Monte Carlo", f"{success_pct:.1f}%")
+                col_c.metric("Stress", f"{scores['stress']:.1f}%" if scores["stress"] is not None else "—")
+                col_d.metric("Tornado", f"{scores['tornado']:.1f}%" if scores["tornado"] is not None else "—")
+                st.caption("El agregado usa las ponderaciones configuradas en el sidebar. Ejecuta Stress/Tornado para completar el indicador.")
 
                 # plot envelope
                 y_ax = np.arange(paths.shape[1]) / 12.0
@@ -1037,6 +1047,7 @@ def app():
             if agg_score is not None:
                 st.markdown("### Indicador agregado (ponderado)")
                 st.markdown(f"- Score agregado: **{agg_score:.1f}%** (pesos configurables en sidebar)")
+                st.markdown(f"- Monte Carlo: **{last.get('success_pct'):.1f}%**")
                 if last_stress:
                     st.markdown(f"- Stress: **{last_stress['success_pct']:.1f}%** (última corrida)")
                 if last_tornado and last_tornado.get("success_pct") is not None:
