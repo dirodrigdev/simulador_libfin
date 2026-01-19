@@ -50,6 +50,41 @@ def success_ci(pct, n, z=1.96):
     high = min(1.0, (p + z * se)) * 100.0
     return low, high
 
+def compute_ruin_stats(ruin_idx: np.ndarray, steps_per_year: int, horizon_years: int) -> Dict[str, Any]:
+    total = len(ruin_idx)
+    ruined = ruin_idx[ruin_idx > -1]
+    stats: Dict[str, Any] = {
+        "total_sims": total,
+        "ruined_count": int(ruined.size),
+        "ruined_pct": float(ruined.size / total * 100.0) if total else 0.0,
+        "ruin_years": [],
+        "ruin_hist": {},
+        "survival_curve": [],
+    }
+    if ruined.size == 0:
+        stats["survival_curve"] = [100.0 for _ in range(horizon_years + 1)]
+        return stats
+    ruin_years = ruined / float(steps_per_year)
+    stats["ruin_years"] = ruin_years.tolist()
+    bins = np.arange(0, horizon_years + 1)
+    hist, _ = np.histogram(ruin_years, bins=bins)
+    stats["ruin_hist"] = {int(b): int(h) for b, h in zip(bins[:-1], hist)}
+    survival = []
+    for y in range(horizon_years + 1):
+        alive = (ruin_idx == -1) | (ruin_idx > y * steps_per_year)
+        survival.append(float(alive.mean() * 100.0))
+    stats["survival_curve"] = survival
+    return stats
+
+def aggregate_success_score(scores: Dict[str, Optional[float]], weights: Dict[str, float]) -> Optional[float]:
+    usable = {k: v for k, v in scores.items() if v is not None}
+    if not usable:
+        return None
+    weight_sum = sum(float(weights.get(k, 0.0)) for k in usable.keys())
+    if weight_sum <= 0:
+        return None
+    return sum(float(weights.get(k, 0.0)) * float(usable[k]) for k in usable.keys()) / weight_sum
+
 # ----------------------
 # Dataclasses / Config
 # ----------------------
@@ -548,6 +583,7 @@ def app():
         'sale_cost_pct': 0.02, 'sale_delay_months': 3, 'pct_discretionary': 0.20,
         'discretionary_cut_in_crisis': 0.60, 'rf_reserve_years': 3.5, 'corr_normal': 0.35
     })
+    st.session_state.setdefault('score_weights', {'mc': 0.6, 'stress': 0.3, 'tornado': 0.1})
 
     # Sidebar with forced advanced panel visible
     with st.sidebar:
@@ -594,6 +630,16 @@ def app():
                 'pct_discretionary': float(st.session_state.get('pct_discretionary', adv.get('pct_discretionary', 0.2))),
                 'discretionary_cut_in_crisis': float(st.session_state.get('discretionary_cut_in_crisis', adv.get('discretionary_cut_in_crisis', 0.6))),
                 'rf_reserve_years': float(st.session_state.get('rf_reserve_years', adv.get('rf_reserve_years', 3.5))),
+            })
+        with st.expander("🎯 Indicador agregado (ponderaciones)", expanded=True):
+            w = st.session_state['score_weights']
+            st.slider("Peso Monte Carlo", 0.0, 1.0, float(w.get('mc', 0.6)), 0.05, key="w_mc")
+            st.slider("Peso Stress", 0.0, 1.0, float(w.get('stress', 0.3)), 0.05, key="w_stress")
+            st.slider("Peso Tornado", 0.0, 1.0, float(w.get('tornado', 0.1)), 0.05, key="w_tornado")
+            st.session_state['score_weights'].update({
+                'mc': float(st.session_state.get('w_mc', w.get('mc', 0.6))),
+                'stress': float(st.session_state.get('w_stress', w.get('stress', 0.3))),
+                'tornado': float(st.session_state.get('w_tornado', w.get('tornado', 0.1))),
             })
 
     # Tabs
@@ -749,6 +795,7 @@ def app():
                 p90 = float(np.percentile(terminal_real, 90))
                 ruined = (r_i > -1)
                 ruin_years = (r_i[ruined] / 12.0) if np.any(ruined) else np.array([])
+                ruin_stats = compute_ruin_stats(r_i, cfg_current.steps_per_year, cfg_current.horizon_years)
 
                 st.markdown(f"<div style='padding:12px; border-radius:8px; background:#091121; color:#fff;'>"
                             f"<h2>Éxito: {success_pct:.1f}% (IC95%: {ci_low:.1f}%–{ci_high:.1f}%)</h2>"
@@ -769,6 +816,7 @@ def app():
                 st.plotly_chart(fig, use_container_width=True)
 
                 # save last_run
+                st.session_state["last_withdrawals"] = wds
                 st.session_state["last_run"] = {
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
                     "success_pct": success_pct,
@@ -777,6 +825,7 @@ def app():
                     "p10_terminal_real": p10,
                     "p90_terminal_real": p90,
                     "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
+                    "ruin_stats": ruin_stats,
                     "cfg": cfg_current.__dict__.copy(),
                 }
             except NotImplementedError as e:
@@ -813,13 +862,22 @@ def app():
                 st.stop()
 
             st.info("Corriendo simulación en modo stress (puede tardar varios minutos según n_sims).")
-            paths, cpi, r_i = run_simulation(cfg_obj, False, [], default_withdrawal_profile(), None)
+            wds = st.session_state.get("last_withdrawals", wds if "wds" in locals() else default_withdrawal_profile())
+            paths, cpi, r_i = run_simulation(cfg_obj, False, [], wds, None)
             success_pct = float((r_i <= -1).mean() * 100.0)
             ci_low, ci_high = success_ci(success_pct, int(cfg_obj.n_sims))
             terminal_real = paths[:, -1] / np.maximum(cpi[:, -1], 1e-9)
             p10 = float(np.percentile(terminal_real, 10))
             p50 = float(np.percentile(terminal_real, 50))
             p90 = float(np.percentile(terminal_real, 90))
+            st.session_state["last_stress"] = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "success_pct": success_pct,
+                "success_ci": [ci_low, ci_high],
+                "median_terminal_real": p50,
+                "p10_terminal_real": p10,
+                "p90_terminal_real": p90,
+            }
             st.markdown(f"**Stress result:** Éxito {success_pct:.1f}% (IC95% {ci_low:.1f}%–{ci_high:.1f}%) | Mediana ${fmt(p50)} | P10 ${fmt(p10)}")
 
     # ----------------------
@@ -859,12 +917,19 @@ def app():
                     elif name == "mu_normal_rf":
                         cfg.mu_normal_rf = float(v)
                     # run sim (aggregate)
-                    paths, cpi, r_i = run_simulation(cfg, False, [], default_withdrawal_profile(), None)
+                    wds = st.session_state.get("last_withdrawals", wds if "wds" in locals() else default_withdrawal_profile())
+                    paths, cpi, r_i = run_simulation(cfg, False, [], wds, None)
                     success_pct = float((r_i <= -1).mean() * 100.0)
                     terminal_real = paths[:, -1] / np.maximum(cpi[:, -1], 1e-9)
                     p50 = float(np.percentile(terminal_real, 50))
                     rows.append({"param": name, "value": v, "success_pct": success_pct, "median_terminal": p50})
             df_tornado = pd.DataFrame(rows)
+            tornado_score = float(df_tornado["success_pct"].mean()) if not df_tornado.empty else None
+            st.session_state["last_tornado"] = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "success_pct": tornado_score,
+                "rows": df_tornado.to_dict(orient="records"),
+            }
             st.dataframe(df_tornado)
             # simple bar: delta success relative to median value
             baseline = df_tornado.groupby("param").apply(lambda g: g.loc[g["value"]==g["value"].median()].iloc[0]["success_pct"] if not g.empty else 0).to_dict()
@@ -892,6 +957,43 @@ def app():
             st.markdown(f"- Éxito estimado: **{last['success_pct']:.1f}%** (IC95%: {last['success_ci'][0]:.1f}% – {last['success_ci'][1]:.1f}%)")
             st.markdown(f"- Mediana legado real: **${fmt(last['median_terminal_real'])}**")
             st.markdown(f"- P10: **${fmt(last['p10_terminal_real'])}** | P90: **${fmt(last['p90_terminal_real'])}**")
+            last_stress = st.session_state.get("last_stress")
+            last_tornado = st.session_state.get("last_tornado")
+            scores = {
+                "mc": last.get("success_pct"),
+                "stress": last_stress.get("success_pct") if last_stress else None,
+                "tornado": last_tornado.get("success_pct") if last_tornado else None,
+            }
+            weights = st.session_state.get("score_weights", {"mc": 0.6, "stress": 0.3, "tornado": 0.1})
+            agg_score = aggregate_success_score(scores, weights)
+            if agg_score is not None:
+                st.markdown("### Indicador agregado (ponderado)")
+                st.markdown(f"- Score agregado: **{agg_score:.1f}%** (pesos configurables en sidebar)")
+                if last_stress:
+                    st.markdown(f"- Stress: **{last_stress['success_pct']:.1f}%** (última corrida)")
+                if last_tornado and last_tornado.get("success_pct") is not None:
+                    st.markdown(f"- Tornado (promedio): **{last_tornado['success_pct']:.1f}%**")
+            else:
+                st.info("Corre Stress y Tornado para habilitar el indicador agregado.")
+            ruin_stats = last.get("ruin_stats", {})
+            if ruin_stats:
+                st.markdown("### Distribución de ruinas (tiempo)")
+                ruin_hist = ruin_stats.get("ruin_hist", {})
+                if ruin_stats.get("ruined_count", 0) == 0:
+                    st.success("No se observan ruinas en la simulación base.")
+                else:
+                    years = list(ruin_hist.keys())
+                    counts = list(ruin_hist.values())
+                    fig_ruin = go.Figure()
+                    fig_ruin.add_trace(go.Bar(x=years, y=counts, name="Ruinas por año"))
+                    fig_ruin.update_layout(title="Ruinas por año (simulación base)", template="plotly_dark")
+                    st.plotly_chart(fig_ruin, use_container_width=True)
+                survival_curve = ruin_stats.get("survival_curve", [])
+                if survival_curve:
+                    fig_surv = go.Figure()
+                    fig_surv.add_trace(go.Scatter(x=list(range(len(survival_curve))), y=survival_curve, mode="lines", name="Supervivencia %"))
+                    fig_surv.update_layout(title="Probabilidad de seguir solvente por año", yaxis_title="% supervivencia", template="plotly_dark")
+                    st.plotly_chart(fig_surv, use_container_width=True)
             st.markdown("### Recomendaciones automáticas (heurísticas)")
             cur_success = last['success_pct']
             if cur_success >= 95:
