@@ -3,13 +3,24 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import re
 import json
 
-# --- 1. UTILIDADES ---
-def fmt(v): return f"{int(v):,}".replace(",", ".")
+# -----------------------------------------------------------------------
+# Simulador patrimonial realista
+# - Incluye InstitutionalSimulator y PortfolioSimulator (modo "Cartera Real")
+# - Parámetros avanzados expuestos en sidebar y en fallback en la página principal
+# - Maneja venta de inmueble con fricciones y delay, gasto discrecional y reglas de guardrail
+# -----------------------------------------------------------------------
+
+# --- 0. UTILIDADES ---
+def fmt(v):
+    try:
+        return f"{int(v):,}".replace(",", ".")
+    except Exception:
+        return str(v)
 
 def clean_input(label, val, key):
     """Input numérico robusto con namespaced key para evitar colisiones de Streamlit."""
@@ -26,8 +37,6 @@ def clean_input(label, val, key):
     st.session_state[f"num__{key}"] = out
     return out
 
-def fmt_pct(v): return f"{v*100:.1f}%"
-
 def to_continuous_mu(mu_arith: float) -> float:
     """Convierte retorno aritmético anual (ej 0.11) a drift continuo (log-return)."""
     try:
@@ -35,36 +44,78 @@ def to_continuous_mu(mu_arith: float) -> float:
     except Exception:
         return float(mu_arith)
 
-# --- 2. CONFIGURACIÓN ---
+def success_ci(pct, n, z=1.96):
+    p = pct / 100.0
+    if n <= 0:
+        return pct, pct
+    se = np.sqrt(p * (1 - p) / n)
+    low = max(0.0, (p - z * se)) * 100.0
+    high = min(1.0, (p + z * se)) * 100.0
+    return low, high
+
+# --- 1. DATACLASSES / CONFIG ---
 @dataclass
 class AssetBucket:
-    name: str; weight: float = 0.0; is_bond: bool = False
+    name: str
+    weight: float = 0.0
+    is_bond: bool = False
 
 @dataclass
 class WithdrawalTramo:
-    from_year: int; to_year: int; amount_nominal_monthly_start: float
+    from_year: int
+    to_year: int
+    amount_nominal_monthly_start: float
 
 @dataclass
 class ExtraCashflow:
-    year: int; amount: float; name: str
+    year: int
+    amount: float
+    name: str
 
 @dataclass
 class SimulationConfig:
-    horizon_years: int = 40; steps_per_year: int = 12; initial_capital: float = 1800000000; n_sims: int = 2000
-    mu_normal_rv: float = 0.11; mu_normal_rf: float = 0.06; inflation_mean: float = 0.035; inflation_vol: float = 0.012
-    is_active_managed: bool = True; use_guardrails: bool = True; guardrail_trigger: float = 0.20; guardrail_cut: float = 0.10
-    enable_prop: bool = True; net_inmo_value: float = 500000000; new_rent_cost: float = 1500000
-    emergency_months_trigger: int = 24; extra_cashflows: List[ExtraCashflow] = field(default_factory=list)
-    mu_local_rv: float = -0.15; mu_local_rf: float = 0.08; corr_local: float = -0.25
-    mu_global_rv: float = -0.22; mu_global_rf: float = -0.02; corr_global: float = 0.75
-    prob_enter_local: float = 0.005; prob_enter_global: float = 0.004; prob_exit_crisis: float = 0.085
+    horizon_years: int = 40
+    steps_per_year: int = 12
+    initial_capital: float = 1800000000.0
+    n_sims: int = 2000
+
+    # Nominal arith inputs will be converted to log-drift where required
+    mu_normal_rv: float = 0.11
+    mu_normal_rf: float = 0.06
+    inflation_mean: float = 0.035
+    inflation_vol: float = 0.012
+
+    is_active_managed: bool = True
+    use_guardrails: bool = True
+    guardrail_trigger: float = 0.20
+    guardrail_cut: float = 0.10
+
+    enable_prop: bool = True
+    net_inmo_value: float = 500000000.0
+    new_rent_cost: float = 1500000.0
+    emergency_months_trigger: int = 24
+
+    extra_cashflows: List[ExtraCashflow] = field(default_factory=list)
+
+    mu_local_rv: float = -0.15
+    mu_local_rf: float = 0.08
+    corr_local: float = -0.25
+
+    mu_global_rv: float = -0.22
+    mu_global_rf: float = -0.02
+    corr_global: float = 0.75
+
+    prob_enter_local: float = 0.005
+    prob_enter_global: float = 0.004
+    prob_exit_crisis: float = 0.085
+
     corr_normal: float = 0.35
     t_df: int = 8
     random_seed: Optional[int] = None
     stress_schedule: Optional[List[int]] = None
 
-    # Advanced / realism params
-    p_def: float = 1.0
+    # Advanced params (realism)
+    p_def: float = 1.0  # advanced: shock damping in crisis (default neutral)
     vol_factor_active: float = 0.80
     sale_cost_pct: float = 0.02
     sale_delay_months: int = 3
@@ -72,13 +123,16 @@ class SimulationConfig:
     discretionary_cut_in_crisis: float = 0.60
     rf_reserve_years: float = 3.5
 
-# --- 3. MOTOR SOVEREIGN ---
+# --- 2. INSTITUTIONAL SIMULATOR (aggregate assets) ---
 class InstitutionalSimulator:
     def __init__(self, config: SimulationConfig, assets: List[AssetBucket], withdrawals: List[WithdrawalTramo]):
-        self.cfg = config; self.assets = assets; self.withdrawals = withdrawals
+        self.cfg = config
+        self.assets = assets
+        self.withdrawals = withdrawals
         self.dt = 1.0 / config.steps_per_year
         self.total_steps = int(config.horizon_years * config.steps_per_year)
-        # mu_regimes expects continuous drift (log-return)
+
+        # expect mu_* are already continuous drifts when passed here
         self.mu_regimes = np.array([
             [self.cfg.mu_normal_rv, self.cfg.mu_normal_rf],
             [self.cfg.mu_local_rv, self.cfg.mu_local_rf],
@@ -91,22 +145,32 @@ class InstitutionalSimulator:
             np.linalg.cholesky(np.array([[1.0, float(self.cfg.corr_local)], [float(self.cfg.corr_local), 1.0]])),
             np.linalg.cholesky(np.array([[1.0, float(self.cfg.corr_global)], [float(self.cfg.corr_global), 1.0]])),
         ]
-        self.p_norm_l = self.cfg.prob_enter_local; self.p_norm_g = self.cfg.prob_enter_global; self.p_exit = self.cfg.prob_exit_crisis
+        self.p_norm_l = self.cfg.prob_enter_local
+        self.p_norm_g = self.cfg.prob_enter_global
+        self.p_exit = self.cfg.prob_exit_crisis
         self.rng = np.random.default_rng(self.cfg.random_seed)
 
     def run(self):
-        n_sims, n_steps = self.cfg.n_sims, self.total_steps
-        cap_paths = np.zeros((n_sims, n_steps + 1)); cap_paths[:, 0] = self.cfg.initial_capital
-        cpi_paths = np.ones((n_sims, n_steps + 1)); is_alive = np.ones(n_sims, dtype=bool)
-        ruin_idx = np.full(n_sims, -1); has_h = np.full(n_sims, self.cfg.enable_prop, dtype=bool)
+        n_sims, n_steps = int(self.cfg.n_sims), self.total_steps
+        cap_paths = np.zeros((n_sims, n_steps + 1), dtype=float)
+        cap_paths[:, 0] = float(self.cfg.initial_capital)
+
+        cpi_paths = np.ones((n_sims, n_steps + 1), dtype=float)
+        is_alive = np.ones(n_sims, dtype=bool)
+        ruin_idx = np.full(n_sims, -1, dtype=int)
+        has_h = np.full(n_sims, self.cfg.enable_prop, dtype=bool)
         pending_sale = np.full(n_sims, -1, dtype=int)  # -1 means none
-        asset_vals = np.zeros((n_sims, 2))
+
+        # aggregate assets: two buckets RV & RF
+        asset_vals = np.zeros((n_sims, 2), dtype=float)
         rv_w = next((a.weight for a in self.assets if not a.is_bond), 0.6)
-        asset_vals[:, 0] = self.cfg.initial_capital * rv_w
-        asset_vals[:, 1] = self.cfg.initial_capital * (1.0 - rv_w)
+        asset_vals[:, 0] = float(self.cfg.initial_capital) * float(rv_w)
+        asset_vals[:, 1] = float(self.cfg.initial_capital) * (1.0 - float(rv_w))
 
         regime = np.zeros(n_sims, dtype=int)
         df = int(self.cfg.t_df)
+
+        # Build multivariate T innovations with shared chi-square for tail dependence
         g = self.rng.standard_normal((n_sims, n_steps, 2))
         w = self.rng.chisquare(df, (n_sims, n_steps, 1))
         Z_raw = (g / np.sqrt(w / df)) / np.sqrt(df / (df - 2))
@@ -116,6 +180,8 @@ class InstitutionalSimulator:
             alive = is_alive
             if not np.any(alive):
                 break
+
+            # regimes (Markov) or stress schedule
             schedule = getattr(self.cfg, "stress_schedule", None)
             if schedule is not None and isinstance(schedule, list) and len(schedule) >= n_steps:
                 regime[alive] = int(schedule[t])
@@ -123,7 +189,8 @@ class InstitutionalSimulator:
                 reg_prev = regime.copy()
                 m0 = (reg_prev == 0) & alive
                 if np.any(m0):
-                    r = self.rng.random(np.sum(m0)); idx = np.where(m0)[0]
+                    r = self.rng.random(np.sum(m0))
+                    idx = np.where(m0)[0]
                     regime[idx[r < self.p_norm_l]] = 1
                     regime[idx[(r >= self.p_norm_l) & (r < (self.p_norm_l + self.p_norm_g))]] = 2
                 mc = (reg_prev > 0) & alive
@@ -131,24 +198,30 @@ class InstitutionalSimulator:
                     idxc = np.where(mc)[0]
                     regime[idxc[self.rng.random(np.sum(mc)) < self.p_exit]] = 0
 
-            z_t = Z_raw[:, t, :]; z_f = np.zeros_like(z_t)
+            z_t = Z_raw[:, t, :]
+            z_f = np.zeros_like(z_t)
             for r_idx, L in enumerate(self.L_mats):
                 m = (regime == r_idx) & alive
                 if np.any(m):
                     z_f[m] = np.dot(z_t[m], L.T)
 
-            p_def = np.ones(n_sims) * float(self.cfg.p_def)  # advanced param, default neutral 1.0
-            mus, sigs = self.mu_regimes[regime], self.sigma_regimes[regime]
+            p_def = np.ones(n_sims) * float(self.cfg.p_def)  # advanced param (default 1.0)
+            mus = self.mu_regimes[regime]
+            sigs = self.sigma_regimes[regime]
+            # apply log-normal step to each bucket (RV, RF)
             asset_vals[alive] *= np.exp((mus[alive] - 0.5 * sigs[alive] ** 2) * self.dt + sigs[alive] * np.sqrt(self.dt) * z_f[alive] * p_def[alive, None])
+
+            # inflation
             cpi_paths[:, t + 1] = cpi_paths[:, t] * (1 + (inf_sh[:, t] + (regime == 1) * 0.003))
 
+            # extra cashflows (annual)
             if (t + 1) % 12 == 0:
                 y = (t + 1) // 12
                 for e in self.cfg.extra_cashflows:
                     if e.year == y:
                         asset_vals[alive, 1] += e.amount * cpi_paths[alive, t + 1]
 
-            # handle pending sales
+            # pending sale processing
             pending = (pending_sale >= 0) & alive
             if np.any(pending):
                 pending_sale[pending] -= 1
@@ -159,26 +232,27 @@ class InstitutionalSimulator:
                     has_h[done] = False
                     pending_sale[done] = -1
 
-            # monthly spend: apply discretionary split and guardrails
+            # monthly withdrawal calculation (discretionary + essential)
             cur_y = (t + 1) / 12.0
             m_spend = np.zeros(n_sims)
             for w in self.withdrawals:
                 if w.from_year <= cur_y < w.to_year:
-                    m_spend = w.amount_nominal_monthly_start * cpi_paths[:, t + 1]
+                    m_spend = float(w.amount_nominal_monthly_start) * cpi_paths[:, t + 1]
                     break
 
             pct_dis = float(self.cfg.pct_discretionary)
             disc = m_spend * pct_dis
             ess = m_spend - disc
 
+            # guardrails
             if self.cfg.use_guardrails and np.any(m_spend > 0):
                 cur_real = np.sum(asset_vals, axis=1) / cpi_paths[:, t + 1]
                 trig_gr = alive & (cur_real < (self.cfg.initial_capital * (1.0 - self.cfg.guardrail_trigger)))
                 if np.any(trig_gr):
-                    ess[trig_gr] *= (1.0 - self.cfg.guardrail_cut)
-                    disc[trig_gr] *= (1.0 - self.cfg.guardrail_cut)
+                    ess[trig_gr] *= (1 - self.cfg.guardrail_cut)
+                    disc[trig_gr] *= (1 - self.cfg.guardrail_cut)
 
-            # discretionary behavior in crisis
+            # discretionary cut in crisis (user behavioral response)
             disc_keep = 1.0 - float(self.cfg.discretionary_cut_in_crisis)
             in_crisis = (regime > 0) & alive
             if np.any(in_crisis):
@@ -186,7 +260,7 @@ class InstitutionalSimulator:
 
             m_spend_adj = ess + disc
 
-            # emergency/institutional sale logic: schedule sale or immediate injection depending on delay
+            # property emergency sale trigger
             trig = alive & has_h & (np.sum(asset_vals, axis=1) < m_spend_adj * self.cfg.emergency_months_trigger)
             if np.any(trig):
                 delay = int(self.cfg.sale_delay_months)
@@ -197,7 +271,7 @@ class InstitutionalSimulator:
                     else:
                         pending_sale[i] = delay
 
-            # automatic early-sale rule based on RF liquidity months
+            # automatic early sale rule based on RF liquidity months
             with np.errstate(divide='ignore', invalid='ignore'):
                 rf_balance = asset_vals[:, 1]
                 rf_liquid_months = np.where(m_spend_adj > 0, rf_balance / m_spend_adj, np.inf)
@@ -212,20 +286,27 @@ class InstitutionalSimulator:
                         else:
                             pending_sale[i] = int(self.cfg.sale_delay_months)
 
-            # withdrawals: RF first
+            # withdrawals: use RF first, then RV
             out = m_spend_adj + (self.cfg.enable_prop & (~has_h)) * (self.cfg.new_rent_cost * cpi_paths[:, t + 1])
             wd = np.minimum(out, np.sum(asset_vals, axis=1))
-            rf_b = np.maximum(asset_vals[:, 1], 0); t_rf = np.minimum(wd, rf_b)
-            asset_vals[:, 1] -= t_rf; asset_vals[:, 0] -= (wd - t_rf)
+            rf_b = np.maximum(asset_vals[:, 1], 0.0)
+            t_rf = np.minimum(wd, rf_b)
+            asset_vals[:, 1] -= t_rf
+            asset_vals[:, 0] -= (wd - t_rf)
 
-            asset_vals = np.maximum(asset_vals, 0); cap_paths[:, t + 1] = np.sum(asset_vals, axis=1)
+            asset_vals = np.maximum(asset_vals, 0.0)
+            cap_paths[:, t + 1] = np.sum(asset_vals, axis=1)
+
             dead = (cap_paths[:, t + 1] <= 1000) & alive
             if np.any(dead):
-                is_alive[dead] = False; ruin_idx[dead] = t + 1; cap_paths[dead, t + 1:] = 0; asset_vals[dead] = 0
+                is_alive[dead] = False
+                ruin_idx[dead] = t + 1
+                cap_paths[dead, t + 1:] = 0.0
+                asset_vals[dead, :] = 0.0
 
         return cap_paths, cpi_paths, ruin_idx
 
-# --- 3B. PORTAFOLIO POR INSTRUMENTOS (Cartera Real) ---
+# --- 3. PORTFOLIO SIMULATOR (detalle por instrumento) ---
 @dataclass
 class InstrumentPosition:
     instrument_id: str
@@ -256,6 +337,10 @@ def _normalize_portfolio_df(df: pd.DataFrame) -> pd.DataFrame:
     if "saldo_clp" in d.columns and "value_clp" not in d.columns:
         d["value_clp"] = pd.to_numeric(d["saldo_clp"], errors="coerce").fillna(0.0)
     keep_cols = [c for c in ["instrument_id", "name", "value_clp", "tipo", "subtipo", "moneda"] if c in d.columns]
+    if not keep_cols:
+        # minimal fallback
+        d = d.assign(instrument_id=d.index.astype(str), name=d.index.astype(str), value_clp=0.0)
+        keep_cols = ["instrument_id", "name", "value_clp"]
     d = d[keep_cols].copy()
     d["instrument_id"] = d["instrument_id"].astype(str)
     d["name"] = d["name"].astype(str)
@@ -368,7 +453,7 @@ class PortfolioSimulator:
         self.positions = positions
         self.withdrawals = withdrawals
         self.rules = rules
-        self.dt = 1 / cfg.steps_per_year
+        self.dt = 1.0 / cfg.steps_per_year
         self.total_steps = int(cfg.horizon_years * cfg.steps_per_year)
         self.rng = np.random.default_rng(cfg.random_seed)
 
@@ -391,7 +476,13 @@ class PortfolioSimulator:
 
     def _withdraw_order(self) -> List[int]:
         def k(p: InstrumentPosition):
-            return (self.rules.bucket_order.get(p.bucket, 50), int(p.priority), int(getattr(p, 'liquidity_days', 3)), float(p.rv_share), p.instrument_id)
+            return (
+                self.rules.bucket_order.get(p.bucket, 50),
+                int(p.priority),
+                int(getattr(p, 'liquidity_days', 3)),
+                float(p.rv_share),
+                p.instrument_id,
+            )
         idxs = [i for i, p in enumerate(self.positions) if p.include_withdrawals and p.bucket != "PASIVO" and p.value_clp > 0]
         return sorted(idxs, key=lambda i: k(self.positions[i]))
 
@@ -399,10 +490,17 @@ class PortfolioSimulator:
         candidates = [i for i, p in enumerate(self.positions) if p.bucket == "RF_PURA" and p.include_withdrawals]
         if not candidates:
             return None
-        return sorted(candidates, key=lambda i: (int(getattr(self.positions[i], 'liquidity_days', 3)), int(self.positions[i].priority), self.positions[i].instrument_id))[0]
+        return sorted(
+            candidates,
+            key=lambda i: (
+                int(getattr(self.positions[i], 'liquidity_days', 3)),
+                int(self.positions[i].priority),
+                self.positions[i].instrument_id,
+            ),
+        )[0]
 
     def run(self):
-        n_sims, n_steps = self.cfg.n_sims, self.total_steps
+        n_sims, n_steps = int(self.cfg.n_sims), self.total_steps
         n_instr = len(self.positions)
         if n_instr == 0:
             raise ValueError("Cartera vacía")
@@ -415,7 +513,7 @@ class PortfolioSimulator:
         cap_paths[:, 0] = np.sum(values, axis=1)
         cpi_paths = np.ones((n_sims, n_steps + 1), dtype=float)
         is_alive = np.ones(n_sims, dtype=bool)
-        ruin_idx = np.full(n_sims, -1)
+        ruin_idx = np.full(n_sims, -1, dtype=int)
         has_h = np.full(n_sims, self.cfg.enable_prop, dtype=bool)
         pending_sale = np.full(n_sims, -1, dtype=int)
         regime = np.zeros(n_sims, dtype=int)
@@ -488,7 +586,7 @@ class PortfolioSimulator:
 
             cpi_paths[:, t + 1] = cpi_paths[:, t] * (1 + (inf_sh[:, t] + (regime == 1) * 0.003))
 
-            # pending sales processing
+            # pending sales
             pending = (pending_sale >= 0) & alive
             if np.any(pending):
                 pending_sale[pending] -= 1
@@ -507,7 +605,7 @@ class PortfolioSimulator:
                         sink = rf_sink if rf_sink is not None else 0
                         values[alive, sink] += e.amount * cpi_paths[alive, t + 1]
 
-            cur_y = (t + 1) / 12
+            cur_y = (t + 1) / 12.0
             m_spend = np.zeros(n_sims)
             for wtr in self.withdrawals:
                 if wtr.from_year <= cur_y < wtr.to_year:
@@ -527,8 +625,8 @@ class PortfolioSimulator:
 
             disc_keep = 1.0 - float(self.cfg.discretionary_cut_in_crisis)
             in_crisis = (regime > 0) & alive
-            if np.any(in_crisis):
-                disc[in_crisis] *= disc_keep
+            if np.any(in_crrisis := in_crisis):
+                disc[in_crrisis] *= disc_keep
 
             m_spend_adj = ess + disc
 
@@ -577,6 +675,7 @@ class PortfolioSimulator:
 
             cap_paths[:, t + 1] = np.sum(values, axis=1)
 
+            # refill RF logic at rebalancing
             if self.rules.rebalance_every_months > 0 and ((t + 1) % self.rules.rebalance_every_months == 0) and (self.rules.rf_reserve_years > 0):
                 if rf_sink is not None and len(rf_idxs) > 0:
                     target = (self.rules.rf_reserve_years * 12) * np.maximum(m_spend_adj, 0)
@@ -607,156 +706,9 @@ class PortfolioSimulator:
 
         return cap_paths, cpi_paths, ruin_idx
 
-# --- 4. HELPERS / DETERMINISTIC / METRICS ---
-def _build_withdrawals(horiz:int, r1:int, d1:int, r2:int, d2:int, r3:int):
-    d1 = int(max(0, min(d1, horiz)))
-    d2 = int(max(0, min(d2, max(0, horiz - d1))))
-    wds = [
-        WithdrawalTramo(0, d1, r1),
-        WithdrawalTramo(d1, d1 + d2, r2),
-        WithdrawalTramo(d1 + d2, horiz, r3),
-    ]
-    wds = [w for w in wds if w.to_year > w.from_year]
-    return wds
-
-def _success_pct(ruin_idx: np.ndarray) -> float:
-    if ruin_idx.size == 0:
-        return 0.0
-    ruined = (ruin_idx > -1).mean()
-    return float((1.0 - ruined) * 100.0)
-
-def _median_ruin_year(ruin_idx: np.ndarray):
-    ruined = ruin_idx[ruin_idx > -1]
-    if ruined.size == 0:
-        return None
-    return float(np.median(ruined) / 12.0)
-
-def _deterministic_institutional(cfg: SimulationConfig, withdrawals, rv_weight: float):
-    steps = int(cfg.horizon_years * 12)
-    dt = 1.0 / 12.0
-    cpi = 1.0
-    rv = float(cfg.initial_capital) * float(rv_weight)
-    rf = float(cfg.initial_capital) * (1.0 - float(rv_weight))
-    has_house = bool(cfg.enable_prop)
-    cap_path = np.zeros(steps + 1); cpi_path = np.zeros(steps + 1)
-    cap_path[0] = rv + rf; cpi_path[0] = 1.0
-
-    for t in range(steps):
-        rv *= float(np.exp(cfg.mu_normal_rv * dt))
-        rf *= float(np.exp(cfg.mu_normal_rf * dt))
-        cpi *= (1.0 + cfg.inflation_mean * dt)
-        if (t + 1) % 12 == 0:
-            y = (t + 1) // 12
-            for e in cfg.extra_cashflows:
-                if e.year == y:
-                    rf += float(e.amount) * cpi
-        cur_y = (t + 1) / 12.0
-        m_spend = 0.0
-        for w in withdrawals:
-            if w.from_year <= cur_y < w.to_year:
-                m_spend = float(w.amount_nominal_monthly_start) * cpi
-                break
-        if cfg.use_guardrails and m_spend > 0:
-            cur_real = (rv + rf) / cpi
-            if cur_real < cfg.initial_capital * (1.0 - cfg.guardrail_trigger):
-                m_spend *= (1.0 - cfg.guardrail_cut)
-        if (not has_house) and cfg.new_rent_cost > 0:
-            m_spend += float(cfg.new_rent_cost) * cpi
-        need = m_spend
-        w_rf = min(rf, need)
-        rf -= w_rf
-        need -= w_rf
-        if need > 1e-9:
-            rv = max(0.0, rv - need); need = 0.0
-        total = rv + rf
-        if cfg.enable_prop and has_house and m_spend > 0 and total < (m_spend * cfg.emergency_months_trigger):
-            rf += float(cfg.net_inmo_value) * cpi; has_house = False; total = rv + rf
-        if total <= 0: rv = rf = 0.0
-        cap_path[t + 1] = rv + rf; cpi_path[t + 1] = cpi
-    return cap_path, cpi_path
-
-def _deterministic_portfolio(cfg: SimulationConfig, positions, rules: PortfolioRulesConfig, withdrawals):
-    dt = 1.0 / 12.0
-    steps = int(cfg.horizon_years * 12)
-    g_rv = float(np.exp(cfg.mu_normal_rv * dt)); g_rf = float(np.exp(cfg.mu_normal_rf * dt))
-    pos = positions or []
-    vals = np.array([float(getattr(p, "value_clp", getattr(p, "value", 0.0))) for p in pos], dtype=float)
-
-    def bucket_order(b):
-        return {'RF_PURA': 0, 'BAL': 1, 'RV': 2, 'AFP': 3, 'PASIVO': 99}.get(b, 50)
-
-    def wd_key(i):
-        p = pos[i]
-        bucket = getattr(p, "bucket", getattr(p, "bucket_sim", None))
-        return (bucket_order(bucket), int(getattr(p, "priority", 50)), int(getattr(p, "liquidity_days", 3)), -float(getattr(p, "rv_share", 0.0)))
-
-    def get_wd_indices():
-        idx = [i for i, p in enumerate(pos) if getattr(p, "include_withdrawals", True) and (getattr(p, "bucket", getattr(p, "bucket_sim", None)) != 'PASIVO')]
-        return sorted(idx, key=wd_key)
-
-    wd_idx = get_wd_indices()
-    rf_idx = [i for i, p in enumerate(pos) if getattr(p, "include_withdrawals", True) and (getattr(p, "bucket", getattr(p, "bucket_sim", None)) == 'RF_PURA')]
-
-    cap_path = np.zeros(steps + 1); cpi_path = np.ones(steps + 1); cpi = 1.0; cap_path[0] = float(vals.sum())
-
-    for t in range(steps):
-        for i, p in enumerate(pos):
-            rv = float(max(0.0, min(1.0, getattr(p, "rv_share", 0.0))))
-            vals[i] *= (rv * g_rv + (1.0 - rv) * g_rf)
-        cpi *= (1.0 + float(cfg.inflation_mean) * dt)
-        cur_y = (t + 1) / 12.0
-        m_spend = 0.0
-        for w in withdrawals:
-            if w.from_year <= cur_y < w.to_year:
-                m_spend = float(w.amount_nominal_monthly_start) * cpi
-                break
-        if cfg.use_guardrails and m_spend > 0:
-            cur_real = float(vals.sum()) / cpi
-            if cur_real < cfg.initial_capital * (1.0 - cfg.guardrail_trigger):
-                m_spend *= (1.0 - cfg.guardrail_cut)
-        need = m_spend
-        for i in wd_idx:
-            if need <= 1e-9: break
-            take = min(vals[i], need)
-            vals[i] -= take; need -= take
-        if need > 1e-9: vals[:] = 0.0
-
-        if rules and int(rules.rebalance_every_months) > 0 and (t + 1) % int(rules.rebalance_every_months) == 0 and m_spend > 0:
-            annual_spend = m_spend * 12.0
-            target_rf = float(rules.rf_reserve_years) * annual_spend
-            curr_rf = float(vals[rf_idx].sum()) if rf_idx else 0.0
-            gap = max(0.0, target_rf - curr_rf)
-            if gap > 1e-6:
-                donors = []
-                for b in ['BAL', 'RV', 'AFP']:
-                    donors += [i for i, p in enumerate(pos) if getattr(p, "include_withdrawals", True) and getattr(p, "bucket", getattr(p, "bucket_sim", None)) == b]
-                donors = sorted(donors, key=lambda i: (int(getattr(pos[i], "priority", 50)), int(getattr(pos[i], "liquidity_days", 3)), float(getattr(pos[i], "rv_share", 0.0))))
-                for i in donors:
-                    if gap <= 1e-9: break
-                    take = min(vals[i], gap)
-                    if take <= 0: continue
-                    vals[i] -= take
-                    if rf_idx:
-                        vals[rf_idx[0]] += take
-                    else:
-                        j = min(range(len(pos)), key=lambda k: int(getattr(pos[k], "liquidity_days", 3)))
-                        vals[j] += take
-                    gap -= take
-
-        cap_path[t + 1] = float(vals.sum()); cpi_path[t + 1] = cpi
-
-    return cap_path, cpi_path
-
-def success_ci(pct, n, z=1.96):
-    p = pct/100.0
-    if n <= 0:
-        return pct, pct
-    se = np.sqrt(p*(1-p)/n)
-    low = max(0.0, (p - z*se))*100.0
-    high = min(1.0, (p + z*se))*100.0
-    return low, high
-
-# --- 5. UI / APP ---
+# -----------------------------------------------------------------------
+#  UI ENTRYPOINT
+# -----------------------------------------------------------------------
 def app(
     default_rf: int = 720000000,
     default_rv: int = 1080000000,
@@ -764,9 +716,8 @@ def app(
     portfolio_df: Optional[pd.DataFrame] = None,
     macro_data: Optional[Dict[str, Any]] = None,
     portfolio_json: Optional[str] = None,
-    **_ignored_kwargs,
 ):
-    # Ensure advanced defaults exist so the expander always shows
+    # Session defaults & safety
     st.session_state.setdefault('extra_events', [])
     st.session_state.setdefault('evy', 5)
     st.session_state.setdefault('evt', 'Entrada')
@@ -780,52 +731,72 @@ def app(
         'pct_discretionary': 0.20,
         'discretionary_cut_in_crisis': 0.60,
         'rf_reserve_years': 3.5,
+        'corr_normal': 0.35,
     })
 
-    positions: List[InstrumentPosition] = []
-    rules = PortfolioRulesConfig()
-    portfolio_ready = False
-    edited = None
-
+    st.set_page_config(page_title="Sovereign Alpha Engine", layout="wide")
     st.markdown("## 🦅 Panel de Decisión Patrimonial (Versión Realista)")
 
     SC_RET = {"Conservador": [0.08, 0.045], "Histórico (11%)": [0.11, 0.06], "Crecimiento (13%)": [0.13, 0.07]}
     SC_GLO = {"Crash Financiero": [-0.22, -0.02, 0.75], "Colapso Sistémico": [-0.30, -0.06, 0.92], "Recesión Estándar": [-0.15, 0.01, 0.55]}
 
+    # Fallback advanced controls on main page (in case sidebar widgets are not rendered)
+    show_adv_main = st.checkbox("Mostrar configuración avanzada (fallback)", value=False, key="show_adv_main")
+    if show_adv_main:
+        st.caption("Panel avanzado (fallback): los mismos controles que en la barra lateral.")
+        adv = st.session_state.get('advanced', {})
+        p_def_adv = st.number_input("p_def (shock damping en crisis, advanced)", 0.0, 2.0, adv.get('p_def', 1.0), step=0.05)
+        vol_factor_active = st.number_input("vol_factor_active (si gestor activo)", 0.1, 1.0, adv.get('vol_factor_active', 0.80), step=0.05)
+        manager_riskoff = st.slider("manager_riskoff_in_crisis (0..1)", 0.0, 1.0, adv.get('manager_riskoff', 0.20), 0.05)
+        sale_cost = st.number_input("sale_cost_pct (venta casa)", 0.0, 0.2, adv.get('sale_cost_pct', 0.02), step=0.005)
+        sale_delay = st.number_input("sale_delay_months (venta casa)", 0, 12, adv.get('sale_delay_months', 3), step=1)
+        pct_discr = st.number_input("pct_discretionary (gasto)", 0.0, 1.0, adv.get('pct_discretionary', 0.20), step=0.05)
+        disc_cut = st.number_input("discretionary_cut_in_crisis", 0.0, 1.0, adv.get('discretionary_cut_in_crisis', 0.60), step=0.05)
+        rf_reserve_years = st.number_input("rf_reserve_years (años)", 0.0, 10.0, adv.get('rf_reserve_years', 3.5), step=0.5)
+
+        st.session_state['advanced'] = {
+            'p_def': float(p_def_adv),
+            'vol_factor_active': float(vol_factor_active),
+            'manager_riskoff': float(manager_riskoff),
+            'sale_cost_pct': float(sale_cost),
+            'sale_delay_months': int(sale_delay),
+            'pct_discretionary': float(pct_discr),
+            'discretionary_cut_in_crisis': float(disc_cut),
+            'rf_reserve_years': float(rf_reserve_years),
+            'corr_normal': float(st.session_state['advanced'].get('corr_normal', 0.35)),
+        }
+
+    # Sidebar controls
     with st.sidebar:
-        st.header("⚙️ Configuración básica")
+        st.header("⚙️ Configuración")
         use_portfolio = st.checkbox("Modo Cartera Real (Instrumentos)", value=st.session_state.get("use_portfolio", False))
         st.session_state["use_portfolio"] = use_portfolio
         is_active = st.checkbox("Gestión Activa / Balanceados", value=True)
         sel_glo = st.selectbox("Crisis Global", list(SC_GLO.keys()), index=0)
         st.caption(f"Stress RV: {SC_GLO[sel_glo][0]*100:.1f}%")
-
         st.divider()
         sel_ret = st.selectbox("Rentabilidad Normal", list(SC_RET.keys()) + ["Personalizado"], index=1)
         if sel_ret == "Personalizado":
-            c_rv_in = st.number_input("RV % Nom. (ej. 11 = 11%)", 0.0, 50.0, 11.0)/100.0
-            c_rf_in = st.number_input("RF % Nom. (ej. 6 = 6%)", 0.0, 50.0, 6.0)/100.0
+            c_rv_in = st.number_input("RV % Nom. (ej. 11 = 11%)", 0.0, 50.0, 11.0) / 100.0
+            c_rf_in = st.number_input("RF % Nom. (ej. 6 = 6%)", 0.0, 50.0, 6.0) / 100.0
         else:
             c_rv_in, c_rf_in = SC_RET[sel_ret]
             st.info(f"RV: {c_rv_in*100:.1f}% | RF: {c_rf_in*100:.1f}%")
-
         n_sims = st.slider("Simulaciones", 500, 5000, 2000, step=100)
         horiz = st.slider("Horizonte (años)", 10, 50, 40)
 
-        # Advanced expander visible by default
-        with st.expander("Configuración avanzada (mostrado)", expanded=True):
+        with st.expander("Configuración avanzada (sidebar)", expanded=False):
             st.subheader("Parámetros avanzados (default prudente)")
-            adv = st.session_state['advanced']
+            adv = st.session_state.get('advanced', {})
             p_def_adv = st.number_input("p_def (shock damping en crisis, advanced)", 0.0, 2.0, adv.get('p_def', 1.0), step=0.05)
             vol_factor_active = st.number_input("vol_factor_active (si gestor activo)", 0.1, 1.0, adv.get('vol_factor_active', 0.80), step=0.05)
-            manager_riskoff = st.slider("manager_riskoff_in_crisis (0..1)", 0.0, 1.0, adv.get('manager_riskoff', rules.manager_riskoff_in_crisis), 0.05)
+            manager_riskoff = st.slider("manager_riskoff_in_crisis (0..1)", 0.0, 1.0, adv.get('manager_riskoff', 0.20), 0.05)
             sale_cost = st.number_input("sale_cost_pct (venta casa)", 0.0, 0.2, adv.get('sale_cost_pct', 0.02), step=0.005)
             sale_delay = st.number_input("sale_delay_months (venta casa)", 0, 12, adv.get('sale_delay_months', 3), step=1)
             pct_discr = st.number_input("pct_discretionary (gasto)", 0.0, 1.0, adv.get('pct_discretionary', 0.20), step=0.05)
             disc_cut = st.number_input("discretionary_cut_in_crisis", 0.0, 1.0, adv.get('discretionary_cut_in_crisis', 0.60), step=0.05)
             rf_reserve_years = st.number_input("rf_reserve_years (años)", 0.0, 10.0, adv.get('rf_reserve_years', 3.5), step=0.5)
 
-            # persist advanced choices
             st.session_state['advanced'] = {
                 'p_def': float(p_def_adv),
                 'vol_factor_active': float(vol_factor_active),
@@ -835,47 +806,44 @@ def app(
                 'pct_discretionary': float(pct_discr),
                 'discretionary_cut_in_crisis': float(disc_cut),
                 'rf_reserve_years': float(rf_reserve_years),
+                'corr_normal': float(st.session_state['advanced'].get('corr_normal', 0.35)),
             }
 
+    # Tabs
     tab_sim, tab_stress, tab_diag, tab_sum, tab_opt = st.tabs(["📊 Simulación", "🧯 Stress", "🩻 Diagnóstico", "🧾 Resumen", "🎯 Optimizador"])
 
-    tot_ini = default_rf + default_rv
-    pct_rv_ini = 60
-
+    # --- Simulación Tab (principal) ---
     with tab_sim:
-        positions = []
+        # Inputs: either portfolio real or aggregated simple inputs
+        positions: List[InstrumentPosition] = []
         rules = PortfolioRulesConfig()
         portfolio_ready = False
-        cap_val = tot_ini
-        rv_sl = pct_rv_ini
-        rv_pct = float(rv_sl)
 
         if use_portfolio:
             st.subheader("📦 Cartera Real (Instrumentos)")
-            src = st.radio("Fuente de cartera", ["Usar datos del Dashboard", "Pegar JSON"], horizontal=True)
+            src = st.radio("Fuente de cartera", ["Pegar JSON", "Usar datos del Dashboard"], horizontal=True)
             df_src = None
-            if src == "Usar datos del Dashboard":
-                df_src = portfolio_df if portfolio_df is not None else st.session_state.get("portfolio_df")
-            else:
+            if src == "Pegar JSON":
                 default_txt = portfolio_json or st.session_state.get("portfolio_json", "")
-                txt = st.text_area("JSON", value=default_txt, height=180, placeholder="Pega acá el JSON completo (registros → instrumentos)")
+                txt = st.text_area("JSON", value=default_txt, height=200, placeholder="Pega acá el JSON completo (registros → instrumentos)")
                 if txt.strip():
                     st.session_state["portfolio_json"] = txt
                     try:
                         df_src = parse_portfolio_json(txt)
                     except Exception as e:
                         st.error(f"No pude parsear el JSON: {e}")
+            else:
+                df_src = portfolio_df if portfolio_df is not None else None
 
             if df_src is None or (hasattr(df_src, "empty") and df_src.empty):
                 st.warning("No hay datos de cartera para simular en modo instrumentos.")
             else:
-                df_base = _normalize_portfolio_df(df_src)
-                df_base = enrich_with_meta(df_base)
+                df_base = enrich_with_meta(_normalize_portfolio_df(df_src))
+                # data_editor can fail on older streamlit; wrap in try
                 try:
                     edited = st.data_editor(
                         df_base,
                         use_container_width=True,
-                        num_rows="fixed",
                         column_config={
                             "rv_share": st.column_config.NumberColumn("% RV (0-1)", min_value=0.0, max_value=1.0, step=0.01),
                             "rv_min": st.column_config.NumberColumn("RV min (0-1)", min_value=0.0, max_value=1.0, step=0.01),
@@ -889,19 +857,22 @@ def app(
                         key="portfolio_editor",
                     )
                 except Exception:
-                    # fallback if data_editor not available
                     edited = df_base.copy()
 
                 tot = float(edited["value_clp"].sum())
                 rv_amt = float((edited["value_clp"] * edited["rv_share"]).sum())
                 rf_pura_amt = float(edited.loc[edited["bucket"] == "RF_PURA", "value_clp"].sum())
                 rv_pct = 0.0 if tot <= 0 else 100.0 * rv_amt / tot
-                rv_sl = int(round(rv_pct))
-                m1, m2, m3 = st.columns(3)
-                with m1: st.metric("Patrimonio (CLP)", f"${fmt(tot)}")
-                with m2: st.metric("Motor (RV) estimado", f"{rv_pct:.1f}%")
-                with m3: st.metric("RF pura hoy", f"${fmt(rf_pura_amt)}")
 
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("Patrimonio (CLP)", f"${fmt(tot)}")
+                with c2:
+                    st.metric("Motor (RV) estimado", f"{rv_pct:.1f}%")
+                with c3:
+                    st.metric("RF pura hoy", f"${fmt(rf_pura_amt)}")
+
+                # portfolio rules
                 rr1, rr2, rr3, rr4 = st.columns(4)
                 with rr1:
                     rules.rf_reserve_years = st.slider("Reserva RF pura (años)", 0.0, 10.0, float(st.session_state.get('advanced', {}).get('rf_reserve_years', 3.5)), 0.5)
@@ -911,7 +882,7 @@ def app(
                 with rr3:
                     rules.rebalance_only_when_normal = st.checkbox("Rebalance solo si NO hay crisis", value=True)
                 with rr4:
-                    rules.manager_riskoff_in_crisis = st.slider("Gestor defensivo en crisis (0-1)", 0.0, 1.0, float(st.session_state.get('advanced', {}).get('manager_riskoff', rules.manager_riskoff_in_crisis)), 0.05)
+                    rules.manager_riskoff_in_crisis = st.slider("Gestor defensivo en crisis (0-1)", 0.0, 1.0, float(st.session_state.get('advanced', {}).get('manager_riskoff', 0.20)), 0.05)
 
                 positions = []
                 for _, r in edited.iterrows():
@@ -929,20 +900,27 @@ def app(
                             include_withdrawals=bool(r.get("include_withdrawals", True)),
                         )
                     )
-                cap_val = int(round(tot))
-                rv_sl = rv_pct
-                portfolio_ready = cap_val > 0 and any(p.include_withdrawals for p in positions)
+                portfolio_ready = tot > 0 and any(p.include_withdrawals for p in positions)
 
+        # Simple aggregated mode (no instruments)
         if not use_portfolio:
-            c1, c2, c3 = st.columns(3)
-            with c1: cap_val = clean_input("Capital Total ($)", tot_ini, "cap")
-            with c2: rv_sl = st.slider("Motor (RV %)", 0, 100, pct_rv_ini)
-            with c3: st.metric("Reserva RF", f"${fmt(cap_val * (1-rv_sl/100))}")
+            st.subheader("📈 Entrada rápida (modo agregado)")
+            tot_default = default_rf + default_rv
+            cap_val = clean_input("Capital Total ($)", tot_default, "cap")
+            rv_pct = st.slider("Motor (RV %)", 0, 100, 60)
+            st.metric("Reserva RF", f"${fmt(cap_val * (1 - rv_pct/100))}")
 
+        # Spending profile inputs
+        st.markdown("### 💸 Perfil de gasto")
         g1, g2, g3 = st.columns(3)
-        with g1: r1 = clean_input("Gasto F1 (CLP/mes)", 6000000, "r1"); d1 = st.number_input("Años F1", 0, 40, 20)
-        with g2: r2 = clean_input("Gasto F2 (CLP/mes)", 4000000, "r2"); d2 = st.number_input("Años F2", 0, 40, 20)
-        with g3: r3 = clean_input("Gasto F3 (CLP/mes)", 4000000, "r3")
+        with g1:
+            r1 = clean_input("Gasto F1 (CLP/mes)", 6000000, "r1")
+            d1 = st.number_input("Años F1", 0, 40, 20)
+        with g2:
+            r2 = clean_input("Gasto F2 (CLP/mes)", 4000000, "r2")
+            d2 = st.number_input("Años F2", 0, 40, 20)
+        with g3:
+            r3 = clean_input("Gasto F3 (CLP/mes)", 4000000, "r3")
 
         with st.expander("💸 Inyecciones o Salidas"):
             st.session_state.setdefault('extra_events', [])
@@ -968,25 +946,27 @@ def app(
         enable_p = st.checkbox("Venta Casa Emergencia", value=True)
         val_h = clean_input("Valor Neto Casa ($)", default_inmo_neto, "vi") if enable_p else 0
 
+        # Build extra cashflows objects
         extra_events_objs = [ExtraCashflow(int(e["year"]), float(e["amount"]), e.get("name", "Hito")) for e in st.session_state.get("extra_events", [])]
 
-        # Build cfg_current
+        # Build cfg_current and convert arithmetic mu to continuous drift
         adv = st.session_state.get('advanced', {})
-        mu_rv_cont = to_continuous_mu(c_rv_in)
-        mu_rf_cont = to_continuous_mu(c_rf_in)
+        mu_rv_cont = to_continuous_mu(c_rv_in) if 'c_rv_in' in locals() else to_continuous_mu(0.11)
+        mu_rf_cont = to_continuous_mu(c_rf_in) if 'c_rf_in' in locals() else to_continuous_mu(0.06)
+
         cfg_current = SimulationConfig(
             horizon_years=horiz,
-            initial_capital=cap_val,
-            n_sims=n_sims,
-            is_active_managed=is_active,
-            enable_prop=enable_p,
-            net_inmo_value=val_h,
-            mu_normal_rv=mu_rv_cont,
-            mu_normal_rf=mu_rf_cont,
+            initial_capital=int(cap_val) if not use_portfolio else (int(sum([p.value_clp for p in positions])) if positions else default_rf + default_rv),
+            n_sims=int(n_sims),
+            is_active_managed=bool(is_active),
+            enable_prop=bool(enable_p),
+            net_inmo_value=float(val_h),
+            mu_normal_rv=float(mu_rv_cont),
+            mu_normal_rf=float(mu_rf_cont),
             extra_cashflows=extra_events_objs,
-            mu_global_rv=SC_GLO[sel_glo][0],
-            mu_global_rf=SC_GLO[sel_glo][1],
-            corr_global=SC_GLO[sel_glo][2],
+            mu_global_rv=float(SC_GLO[sel_glo][0]),
+            mu_global_rf=float(SC_GLO[sel_glo][1]),
+            corr_global=float(SC_GLO[sel_glo][2]),
             corr_normal=float(st.session_state.get('advanced', {}).get('corr_normal', 0.35)),
             p_def=float(adv.get('p_def', 1.0)),
             vol_factor_active=float(adv.get('vol_factor_active', 0.80)),
@@ -996,52 +976,98 @@ def app(
             discretionary_cut_in_crisis=float(adv.get('discretionary_cut_in_crisis', 0.60)),
             rf_reserve_years=float(adv.get('rf_reserve_years', 3.5)),
             t_df=int(8),
+            random_seed=12345,
         )
 
+        # Run simulation button
         if st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim"):
-            wds = _build_withdrawals(horiz, r1, d1, r2, d2, r3)
+            wds = [
+                WithdrawalTramo(0, int(d1), int(r1)),
+                WithdrawalTramo(int(d1), int(d1 + d2), int(r2)),
+                WithdrawalTramo(int(d1 + d2), int(horiz), int(r3))
+            ]
+
             if use_portfolio:
                 if not portfolio_ready:
-                    st.error("Modo instrumentos activo, pero no hay cartera válida (o no hay nada marcado como retirable).")
+                    st.error("Modo instrumentos activo, pero la cartera no está lista o no hay activos retibles.")
                     st.stop()
                 rules.manager_riskoff_in_crisis = float(st.session_state.get('advanced', {}).get('manager_riskoff', rules.manager_riskoff_in_crisis))
                 sim = PortfolioSimulator(cfg_current, positions, wds, rules)
                 paths, cpi, r_i = sim.run()
             else:
-                a_t = [AssetBucket("RV", float(rv_sl)/100.0), AssetBucket("RF", (100.0 - float(rv_sl))/100.0, True)]
+                a_t = [AssetBucket("RV", float(rv_pct) / 100.0), AssetBucket("RF", (100.0 - float(rv_pct)) / 100.0, True)]
                 sim = InstitutionalSimulator(cfg_current, a_t, wds)
                 paths, cpi, r_i = sim.run()
 
-            prob = _success_pct(r_i)
-            ci_low, ci_high = success_ci(prob, int(cfg_current.n_sims))
+            prob = (r_i <= -1).mean()
+            success_pct = float((1.0 - ((r_i > -1).mean())) * 100.0)
+            ci_low, ci_high = success_ci(success_pct, int(cfg_current.n_sims))
             terminal_real = paths[:, -1] / np.maximum(cpi[:, -1], 1e-9)
+            p10 = float(np.percentile(terminal_real, 10))
+            p50 = float(np.percentile(terminal_real, 50))
+            p90 = float(np.percentile(terminal_real, 90))
             ruined = (r_i > -1)
             ruin_years = (r_i[ruined] / 12.0) if np.any(ruined) else np.array([])
-            pcts = np.percentile(paths, [10, 50, 90], axis=0)
 
-            st.markdown(f"<div style='text-align:center; padding:20px; border-radius:10px; background:rgba(30,30,30,0.5);'><h1>Éxito: {prob:.1f}% (IC95%: {ci_low:.1f}%–{ci_high:.1f}%)</h1><h3>Mediana legado real: ${fmt(np.median(terminal_real))}</h3></div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='padding:12px; border-radius:8px; background:#091121; color:#fff;'>"
+                f"<h2>Éxito: {success_pct:.1f}% (IC95%: {ci_low:.1f}%–{ci_high:.1f}%)</h2>"
+                f"<p>Mediana legado real: ${fmt(p50)} | P10: ${fmt(p10)} | P90: ${fmt(p90)}</p>"
+                f"</div>", unsafe_allow_html=True
+            )
 
+            # Plot envelope
             y_ax = np.arange(paths.shape[1]) / 12.0
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=np.concatenate([y_ax, y_ax[::-1]]), y=np.concatenate([np.percentile(paths, 90, 0), np.percentile(paths, 10, 0)[::-1]]), fill='toself', fillcolor='rgba(59,130,246,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
-            fig.add_trace(go.Scatter(x=y_ax, y=np.percentile(paths, 50, 0), line=dict(color='#3b82f6', width=3), name='Mediana'))
+            p90_path = np.percentile(paths, 90, axis=0)
+            p10_path = np.percentile(paths, 10, axis=0)
+            p50_path = np.percentile(paths, 50, axis=0)
+            fig.add_trace(go.Scatter(x=np.concatenate([y_ax, y_ax[::-1]]),
+                                     y=np.concatenate([p90_path, p10_path[::-1]]),
+                                     fill='toself', fillcolor='rgba(59,130,246,0.2)', line=dict(color='rgba(0,0,0,0)'), name='Rango 80%'))
+            fig.add_trace(go.Scatter(x=y_ax, y=p50_path, line=dict(color='#3b82f6', width=3), name='Mediana'))
             fig.update_layout(title="Proyección Patrimonio (Nominal)", template="plotly_dark")
             st.plotly_chart(fig, use_container_width=True)
 
             st.session_state["last_run"] = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "success_pct": float(prob),
+                "success_pct": success_pct,
                 "success_ci": [ci_low, ci_high],
-                "median_terminal_real": float(np.median(terminal_real)),
-                "p10_terminal_real": float(np.percentile(terminal_real, 10)),
-                "p90_terminal_real": float(np.percentile(terminal_real, 90)),
+                "median_terminal_real": p50,
+                "p10_terminal_real": p10,
+                "p90_terminal_real": p90,
                 "median_ruin_year": float(np.median(ruin_years)) if ruin_years.size else None,
-                "p10_path": pcts[0].tolist(),
-                "p50_path": pcts[1].tolist(),
-                "p90_path": pcts[2].tolist(),
-                "cpi_p50": np.percentile(cpi, 50, axis=0).tolist(),
                 "cfg": cfg_current.__dict__.copy(),
-                "rules": rules.__dict__.copy() if use_portfolio else None,
             }
 
-# End of simulador.py
+    # Other tabs (Stress, Diagnóstico, Resumen, Optimizador) can reuse last_run to show deeper analysis.
+    # For brevity these tabs are placeholders but can be expanded; they will read st.session_state["last_run"].
+
+    with tab_sum:
+        st.header("🧾 Resumen Ejecutivo (Beta)")
+        last = st.session_state.get("last_run")
+        if not last:
+            st.info("Ejecuta primero una simulación para obtener un resumen ejecutivo y recomendaciones.")
+        else:
+            st.markdown(f"**Última corrida:** {last['timestamp']}")
+            st.markdown(f"- Éxito estimado: **{last['success_pct']:.1f}%** (IC95%: {last['success_ci'][0]:.1f}% – {last['success_ci'][1]:.1f}%)")
+            st.markdown(f"- Mediana legado real: **${fmt(last['median_terminal_real'])}**")
+            st.markdown(f"- P10: **${fmt(last['p10_terminal_real'])}** | P90: **${fmt(last['p90_terminal_real'])}**")
+            st.markdown("### Recomendaciones iniciales (automáticas)")
+            # Simple heuristic recommendations for 90/95% targets
+            cur_success = last['success_pct']
+            if cur_success >= 95:
+                st.success("Tu plan supera 95% de probabilidad de éxito con las asunciones actuales.")
+            elif cur_success >= 90:
+                st.info("Tu plan supera 90% de probabilidad de éxito. Considera mantener RF_reserve y disciplina de gasto.")
+            else:
+                st.warning("Tu plan NO alcanza 90% de probabilidad. Sugerencias automáticas:")
+                st.markdown("- Reducir gasto discrecional o total.")
+                st.markdown("- Incrementar RF_pura o reservar más años en RF (rf_reserve_years).")
+                st.markdown("- Considerar venta anticipada de inmueble según regla automática (si aplica).")
+            st.markdown("---")
+            st.caption("Nota: este resumen es un primer diagnóstico. Para recomendaciones a medida se requiere calibración con series históricas y análisis tornado detallado.")
+
+# If run as main, start Streamlit app
+if __name__ == "__main__":
+    app()
