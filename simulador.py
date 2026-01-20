@@ -183,7 +183,7 @@ def render_bottom_bar(scores: Dict[str, Optional[float]], weights: Dict[str, flo
         <style>
         :root {
             --sidebar-width: 21rem;
-            --bottom-bar-height: 24vh;
+            --bottom-bar-height: 25vh;
         }
         .main .block-container {
             padding-bottom: calc(var(--bottom-bar-height) + 3rem);
@@ -192,9 +192,9 @@ def render_bottom_bar(scores: Dict[str, Optional[float]], weights: Dict[str, flo
             position: fixed;
             left: calc(var(--sidebar-width) + (100vw - var(--sidebar-width)) / 2);
             transform: translateX(-50%);
-            bottom: calc(1.2rem + (var(--bottom-bar-height) / 2) - 1.5rem);
+            bottom: calc(1.2rem + var(--bottom-bar-height) - 3.1rem);
             z-index: 120;
-            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.35);
+            box-shadow: none;
             width: auto;
             min-width: 0;
             padding: 0.65rem 1.6rem;
@@ -203,14 +203,14 @@ def render_bottom_bar(scores: Dict[str, Optional[float]], weights: Dict[str, flo
         .bottom-bar {
             position: fixed;
             left: var(--sidebar-width);
-            right: 1.5rem;
-            bottom: 1.2rem;
+            right: 0;
+            bottom: 0;
             height: var(--bottom-bar-height);
-            padding: 16px 18px;
-            border-radius: 18px;
-            background: linear-gradient(135deg, rgba(15,23,42,0.95), rgba(30,41,59,0.95));
-            border: 1px solid rgba(148,163,184,0.25);
-            box-shadow: 0 16px 32px rgba(15, 23, 42, 0.35);
+            padding: 64px 24px 20px;
+            border-radius: 0;
+            background: #0f172a;
+            border-top: 1px solid rgba(148,163,184,0.25);
+            box-shadow: none;
             z-index: 110;
         }
         .bottom-grid {
