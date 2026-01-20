@@ -173,6 +173,115 @@ def render_score_bar(
         unsafe_allow_html=True,
     )
 
+def render_bottom_bar(scores: Dict[str, Optional[float]], weights: Dict[str, float]) -> None:
+    agg_score = aggregate_success_score(scores, weights)
+    def fmt_pct(val: Optional[float]) -> str:
+        return f"{val:.1f}%" if val is not None else "—"
+
+    st.markdown(
+        """
+        <style>
+        :root {
+            --sidebar-width: 21rem;
+            --bottom-bar-height: 24vh;
+        }
+        .main .block-container {
+            padding-bottom: calc(var(--bottom-bar-height) + 3rem);
+        }
+        button[kind="primary"] {
+            position: fixed;
+            left: calc(var(--sidebar-width) + (100vw - var(--sidebar-width)) / 2);
+            transform: translateX(-50%);
+            bottom: calc(1.2rem + (var(--bottom-bar-height) / 2) - 1.5rem);
+            z-index: 120;
+            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.35);
+            width: auto;
+            min-width: 0;
+            padding: 0.65rem 1.6rem;
+            border-radius: 999px;
+        }
+        .bottom-bar {
+            position: fixed;
+            left: var(--sidebar-width);
+            right: 1.5rem;
+            bottom: 1.2rem;
+            height: var(--bottom-bar-height);
+            padding: 16px 18px;
+            border-radius: 18px;
+            background: linear-gradient(135deg, rgba(15,23,42,0.95), rgba(30,41,59,0.95));
+            border: 1px solid rgba(148,163,184,0.25);
+            box-shadow: 0 16px 32px rgba(15, 23, 42, 0.35);
+            z-index: 110;
+        }
+        .bottom-grid {
+            display: grid;
+            grid-template-columns: 1.1fr 1fr 1fr 1fr;
+            gap: 12px;
+            height: 100%;
+        }
+        .bottom-card {
+            background: rgba(2, 6, 23, 0.55);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 14px;
+            padding: 14px 16px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .bottom-card h4 {
+            margin: 0 0 6px 0;
+            font-size: 0.8rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .bottom-card p {
+            margin: 0;
+            font-size: 1.8rem;
+            color: #f8fafc;
+            font-weight: 600;
+        }
+        .bottom-meta {
+            margin-top: 8px;
+            color: #94a3b8;
+            font-size: 0.85rem;
+        }
+        @media (max-width: 1200px) {
+            :root { --bottom-bar-height: 30vh; }
+            .bottom-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        f"""
+        <div class="bottom-bar">
+            <div class="bottom-grid">
+                <div class="bottom-card">
+                    <h4>Indicador agregado</h4>
+                    <p>{fmt_pct(agg_score)}</p>
+                    <div class="bottom-meta">MC {weights.get("mc", 0):.0%} · Stress {weights.get("stress", 0):.0%} · Tornado {weights.get("tornado", 0):.0%}</div>
+                </div>
+                <div class="bottom-card">
+                    <h4>Monte Carlo</h4>
+                    <p>{fmt_pct(scores.get("mc"))}</p>
+                </div>
+                <div class="bottom-card">
+                    <h4>Stress</h4>
+                    <p>{fmt_pct(scores.get("stress"))}</p>
+                </div>
+                <div class="bottom-card">
+                    <h4>Tornado</h4>
+                    <p>{fmt_pct(scores.get("tornado"))}</p>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # ----------------------
 # Dataclasses / Config
 # ----------------------
@@ -747,19 +856,6 @@ def app():
     # ----------------------
     with tab_sim:
         st.subheader("Simulación principal")
-        st.markdown(
-            """
-            <style>
-            .run-sim-button button {
-                position: sticky;
-                bottom: 1.25rem;
-                z-index: 50;
-                box-shadow: 0 10px 24px rgba(15, 23, 42, 0.35);
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
         col_inputs, col_results = st.columns([0.45, 0.55], gap="large")
         use_portfolio = st.session_state.get("use_portfolio", False)
         positions: List[InstrumentPosition] = []
@@ -881,10 +977,7 @@ def app():
 
             st.markdown("### 4) Ejecución")
             st.caption("Se ejecutan Monte Carlo, Stress y Tornado en un solo disparo.")
-            with st.container():
-                st.markdown('<div class="run-sim-button">', unsafe_allow_html=True)
-                run_sim = st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim")
-                st.markdown('</div>', unsafe_allow_html=True)
+            run_sim = st.button("🚀 INICIAR SIMULACIÓN", type="primary", key="run_sim")
 
         with col_results:
             last_run = st.session_state.get("last_run")
@@ -987,7 +1080,7 @@ def app():
                 "stress": last_stress.get("success_pct") if last_stress else None,
                 "tornado": last_tornado.get("success_pct") if last_tornado else None,
             }
-            render_score_bar(scores, weights, note="Indicador principal siempre visible. Ejecuta la simulación para actualizarlo.")
+            render_bottom_bar(scores, weights)
             if not last_run:
                 st.info("Ejecuta una simulación para ver los resultados detallados.")
             else:
