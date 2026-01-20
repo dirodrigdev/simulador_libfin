@@ -22,6 +22,21 @@ def fmt(v):
     except Exception:
         return str(v)
 
+def fmt_compact(v: float) -> str:
+    try:
+        n = float(v)
+    except Exception:
+        return str(v)
+    sign = "-" if n < 0 else ""
+    n = abs(n)
+    if n >= 1_000_000_000:
+        return f"{sign}{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{sign}{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{sign}{n / 1_000:.2f}K"
+    return f"{sign}{n:.0f}"
+
 def clean_input(label, val, key):
     widget_key = f"txt__{key}"
     if widget_key not in st.session_state:
@@ -237,9 +252,12 @@ def render_bottom_bar(scores: Dict[str, Optional[float]], weights: Dict[str, flo
         }
         .bottom-card p {
             margin: 0;
-            font-size: 1.8rem;
+            font-size: clamp(1.2rem, 1.6vw, 1.7rem);
             color: #f8fafc;
             font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
         .bottom-meta {
             margin-top: 8px;
@@ -281,6 +299,7 @@ def render_bottom_bar(scores: Dict[str, Optional[float]], weights: Dict[str, flo
         """,
         unsafe_allow_html=True,
     )
+    )
 
 # ----------------------
 # Dataclasses / Config
@@ -320,7 +339,7 @@ class SimulationConfig:
     guardrail_trigger: float = 0.20
     guardrail_cut: float = 0.10
 
-    enable_prop: float = True
+    enable_prop: bool = True
     net_inmo_value: float = 500000000.0
     new_rent_cost: float = 1500000.0
     emergency_months_trigger: int = 24
@@ -707,9 +726,17 @@ class PortfolioSimulator:
         return sorted(candidates, key=lambda i: (int(getattr(self.positions[i], 'liquidity_days', 3)), int(self.positions[i].priority), self.positions[i].instrument_id))[0]
 
     def run(self):
-        # Implementation analogous to InstitutionalSimulator but per-instrument; omitted here to save space
-        # Use the full implementation from prior versions in your repo (we assume it's present)
-        raise NotImplementedError("PortfolioSimulator.run should be the same implementation you had; paste the full method here in the repo.")
+        total_value = sum(p.value_clp for p in self.positions if p.bucket != "PASIVO")
+        if total_value <= 0:
+            raise ValueError("La cartera no tiene saldo positivo para simular.")
+        rv_amount = sum(p.value_clp * p.rv_share for p in self.positions if p.bucket != "PASIVO")
+        rv_weight = rv_amount / total_value
+        assets = [
+            AssetBucket("RV", rv_weight, False),
+            AssetBucket("RF", 1.0 - rv_weight, True),
+        ]
+        sim = InstitutionalSimulator(self.cfg, assets, self.withdrawals)
+        return sim.run()
 
 # ----------------------
 # Helper: build withdrawals default per your request
@@ -1069,6 +1096,7 @@ def app():
                         "success_pct": tornado_score,
                         "rows": df_quick.to_dict(orient="records"),
                     }
+                    st.rerun()
                 except NotImplementedError as e:
                     st.error(f"Función no implementada: {e}. Si usas modo Cartera Real, asegúrate que PortfolioSimulator.run esté definido en este archivo.")
 
@@ -1085,11 +1113,24 @@ def app():
                 st.info("Ejecuta una simulación para ver los resultados detallados.")
             else:
                 st.caption(f"Última corrida: {last_run['timestamp']}")
-
                 kpi_cols = st.columns(3)
-                kpi_cols[0].metric("Éxito Monte Carlo", f"{last_run['success_pct']:.1f}%", f"IC95% {last_run['success_ci'][0]:.1f}%–{last_run['success_ci'][1]:.1f}%")
-                kpi_cols[1].metric("Mediana legado real", f"${fmt(last_run['median_terminal_real'])}")
-                kpi_cols[2].metric("P10 / P90 legado real", f"${fmt(last_run['p10_terminal_real'])} · ${fmt(last_run['p90_terminal_real'])}")
+                kpi_cols[0].metric(
+                    "Éxito Monte Carlo",
+                    f"{last_run['success_pct']:.1f}%",
+                    f"IC95% {last_run['success_ci'][0]:.1f}%–{last_run['success_ci'][1]:.1f}%",
+                )
+                kpi_cols[1].metric(
+                    "Mediana legado real",
+                    f"${fmt_compact(last_run['median_terminal_real'])}",
+                )
+                kpi_cols[1].caption(f"Valor completo: ${fmt(last_run['median_terminal_real'])}")
+                kpi_cols[2].metric(
+                    "P10 / P90 legado real",
+                    f"${fmt_compact(last_run['p10_terminal_real'])} · ${fmt_compact(last_run['p90_terminal_real'])}",
+                )
+                kpi_cols[2].caption(
+                    f"P10 ${fmt(last_run['p10_terminal_real'])} · P90 ${fmt(last_run['p90_terminal_real'])}"
+                )
 
                 fig = go.Figure()
                 years = np.array(last_run.get("plot_years", []))
